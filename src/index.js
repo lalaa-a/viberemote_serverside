@@ -4,6 +4,7 @@ import cors from 'cors'
 import { rateLimit } from 'express-rate-limit'
 import machinesRouter from './routes/machines.js'
 import relayRouter from './routes/relay.js'
+import mobileRouter from './routes/mobile.js'
 
 const app  = express()
 const PORT = process.env.PORT || 3000
@@ -33,6 +34,7 @@ const registerLimiter = rateLimit({
 app.get('/health', (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }))
 app.use('/machines', machinesRouter)
 app.use('/relay', relayRouter)
+app.use('/mobile', mobileRouter)
 
 // Apply strict limiter only to the register endpoint
 app.use('/machines/register', registerLimiter)
