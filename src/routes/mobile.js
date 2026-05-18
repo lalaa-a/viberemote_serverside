@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { db } from '../supabase.js'
 import { requireMachineAuth } from '../middleware/auth.js'
+import { syncAgentPendingCount, deriveStatus } from '../utils.js'
 
 const router = Router()
 
@@ -9,7 +10,78 @@ router.get('/machine', requireMachineAuth, (req, res) => {
   res.json(req.machine)
 })
 
-// GET /mobile/requests — pending requests for this machine
+// ── Sessions ──────────────────────────────────────────────────────────────────
+
+// GET /mobile/sessions — all sessions across all of this user's machines
+router.get('/sessions', requireMachineAuth, async (req, res) => {
+  const { data: machines, error: machinesErr } = await db
+    .from('machines')
+    .select('id')
+    .eq('user_id', req.machine.user_id)
+
+  if (machinesErr) {
+    console.error('[mobile/sessions] machines lookup', machinesErr.message)
+    return res.status(500).json({ error: 'Failed to fetch sessions' })
+  }
+
+  const machineIds = (machines ?? []).map(m => m.id)
+  if (!machineIds.length) return res.json([])
+
+  const { data: agents, error } = await db
+    .from('agents')
+    .select('*, machines(id, label, is_online)')
+    .in('machine_id', machineIds)
+    .order('last_activity_at', { ascending: false, nullsFirst: false })
+
+  if (error) {
+    console.error('[mobile/sessions]', error.message)
+    return res.status(500).json({ error: 'Failed to fetch sessions' })
+  }
+
+  const sessions = (agents ?? []).map(agent => ({
+    id:               agent.id,
+    machine_id:       agent.machine_id,
+    machine_label:    agent.machines?.label ?? 'Unknown',
+    session_id:       agent.session_id,
+    cwd:              agent.cwd,
+    status:           deriveStatus(agent.last_activity_at),
+    pending_count:    agent.pending_count ?? 0,
+    last_activity_at: agent.last_activity_at,
+    started_at:       agent.started_at,
+  }))
+
+  res.json(sessions)
+})
+
+// GET /mobile/sessions/:sessionId/requests — pending requests for one session
+router.get('/sessions/:sessionId/requests', requireMachineAuth, async (req, res) => {
+  const { data: machines } = await db
+    .from('machines')
+    .select('id')
+    .eq('user_id', req.machine.user_id)
+
+  const machineIds = (machines ?? []).map(m => m.id)
+  if (!machineIds.length) return res.json([])
+
+  const { data, error } = await db
+    .from('pending_requests')
+    .select('*, machines(id, label, is_online)')
+    .in('machine_id', machineIds)
+    .eq('session_id', req.params.sessionId)
+    .eq('status', 'pending')
+    .order('created_at', { ascending: false })
+
+  if (error) {
+    console.error('[mobile/sessions/:sessionId/requests]', error.message)
+    return res.status(500).json({ error: 'Failed to fetch session requests' })
+  }
+
+  res.json(data ?? [])
+})
+
+// ── Requests ──────────────────────────────────────────────────────────────────
+
+// GET /mobile/requests — all pending requests for this machine
 router.get('/requests', requireMachineAuth, async (req, res) => {
   const { data, error } = await db
     .from('pending_requests')
@@ -73,6 +145,14 @@ router.post('/decide', requireMachineAuth, async (req, res) => {
     return res.status(400).json({ error: 'decision must be approved or denied' })
   }
 
+  // Fetch agent_id first so we can sync count after the update
+  const { data: reqRow } = await db
+    .from('pending_requests')
+    .select('agent_id')
+    .eq('id', requestId)
+    .eq('machine_id', req.machine.id)
+    .single()
+
   const { error } = await db
     .from('pending_requests')
     .update({
@@ -89,10 +169,12 @@ router.post('/decide', requireMachineAuth, async (req, res) => {
     return res.status(500).json({ error: 'Failed to update decision' })
   }
 
+  await syncAgentPendingCount(reqRow?.agent_id)
+
   res.json({ ok: true })
 })
 
-// GET /mobile/machines — list all machines for this user (via machine's user_id)
+// GET /mobile/machines — all machines for this user
 router.get('/machines', requireMachineAuth, async (req, res) => {
   const { data, error } = await db
     .from('machines')
@@ -135,6 +217,209 @@ router.post('/push-token', requireMachineAuth, async (req, res) => {
   }
 
   res.json({ ok: true })
+})
+
+// ── Prompt injection ──────────────────────────────────────────────────────────
+
+// POST /mobile/prompt — queue a prompt for delivery when the session is idle
+router.post('/prompt', requireMachineAuth, async (req, res) => {
+  const { prompt, sessionId } = req.body
+
+  if (!prompt) {
+    return res.status(400).json({ error: 'prompt is required' })
+  }
+
+  // Resolve machine_id from sessionId — target may be a different machine than the caller
+  let targetMachineId = req.machine.id
+  if (sessionId) {
+    const { data: agent } = await db
+      .from('agents')
+      .select('machine_id, machines(user_id)')
+      .eq('session_id', sessionId)
+      .single()
+
+    if (!agent || agent.machines?.user_id !== req.machine.user_id) {
+      return res.status(403).json({ error: 'Session not found or access denied' })
+    }
+    targetMachineId = agent.machine_id
+  }
+
+  const { data, error } = await db
+    .from('mobile_commands')
+    .insert({
+      machine_id: targetMachineId,
+      user_id:    req.machine.user_id,
+      session_id: sessionId ?? null,
+      prompt,
+    })
+    .select('id')
+    .single()
+
+  if (error) {
+    console.error('[mobile/prompt]', error.message)
+    return res.status(500).json({ error: 'Failed to queue prompt' })
+  }
+
+  res.json({ id: data.id })
+})
+
+// GET /mobile/prompts — list recent prompts for this user (all machines)
+router.get('/prompts', requireMachineAuth, async (req, res) => {
+  const { data: machines } = await db
+    .from('machines')
+    .select('id')
+    .eq('user_id', req.machine.user_id)
+
+  const machineIds = (machines ?? []).map(m => m.id)
+  if (!machineIds.length) return res.json([])
+
+  const { data, error } = await db
+    .from('mobile_commands')
+    .select('id, session_id, prompt, status, created_at, delivered_at')
+    .in('machine_id', machineIds)
+    .order('created_at', { ascending: false })
+    .limit(20)
+
+  if (error) {
+    console.error('[mobile/prompts]', error.message)
+    return res.status(500).json({ error: 'Failed to fetch prompts' })
+  }
+
+  res.json(data ?? [])
+})
+
+// DELETE /mobile/prompt/:id — cancel a prompt that hasn't been delivered yet
+router.delete('/prompt/:id', requireMachineAuth, async (req, res) => {
+  const { error } = await db
+    .from('mobile_commands')
+    .update({ status: 'cancelled' })
+    .eq('id', req.params.id)
+    .eq('user_id', req.machine.user_id)
+    .eq('status', 'pending')
+
+  if (error) {
+    console.error('[mobile/prompt DELETE]', error.message)
+    return res.status(500).json({ error: 'Failed to cancel prompt' })
+  }
+
+  res.json({ ok: true })
+})
+
+// GET /mobile/command/next — called by heartbeat.js every 10s
+// Returns the oldest pending command only when the target session is fully idle
+router.get('/command/next', requireMachineAuth, async (req, res) => {
+  const { data: commands } = await db
+    .from('mobile_commands')
+    .select('*')
+    .eq('machine_id', req.machine.id)
+    .eq('status', 'pending')
+    .order('created_at', { ascending: true })
+    .limit(10)
+
+  if (!commands?.length) return res.json(null)
+
+  // Claude must have been idle for at least 30s (guards against brief pending_count=0 gaps
+  // between chained tool calls)
+  const idleThreshold = new Date(Date.now() - 30_000).toISOString()
+
+  for (const cmd of commands) {
+    let query = db
+      .from('agents')
+      .select('id, session_id, cwd')
+      .eq('machine_id', req.machine.id)
+      .eq('pending_count', 0)
+      .lt('last_activity_at', idleThreshold)
+
+    if (cmd.session_id) {
+      query = query.eq('session_id', cmd.session_id)
+    }
+
+    const { data: agents } = await query.limit(1)
+    if (!agents?.length) continue
+
+    const agent = agents[0]
+
+    // Atomically claim — optimistic lock on status=pending prevents double-delivery
+    const { data: claimed, error: claimErr } = await db
+      .from('mobile_commands')
+      .update({ status: 'delivered', delivered_at: new Date().toISOString() })
+      .eq('id', cmd.id)
+      .eq('status', 'pending')
+      .select('id')
+      .single()
+
+    if (claimErr || !claimed) continue
+
+    return res.json({
+      prompt:     cmd.prompt,
+      sessionId:  agent.session_id,
+      sessionCwd: agent.cwd,
+    })
+  }
+
+  res.json(null)
+})
+
+// ── File browser ──────────────────────────────────────────────────────────────
+
+// POST /mobile/fs/request — ask the desktop to build a file tree
+router.post('/fs/request', requireMachineAuth, async (req, res) => {
+  const { path = '.', sessionId } = req.body
+
+  // Resolve target machine from session (may be different from calling machine)
+  let targetMachineId = req.machine.id
+  if (sessionId) {
+    const { data: agent } = await db
+      .from('agents')
+      .select('machine_id, machines(user_id)')
+      .eq('session_id', sessionId)
+      .single()
+
+    if (agent && agent.machines?.user_id === req.machine.user_id) {
+      targetMachineId = agent.machine_id
+    }
+  }
+
+  const { data, error } = await db
+    .from('fs_requests')
+    .insert({
+      machine_id: targetMachineId,
+      session_id: sessionId ?? null,
+      path,
+    })
+    .select('id')
+    .single()
+
+  if (error) {
+    console.error('[mobile/fs/request]', error.message)
+    return res.status(500).json({ error: 'Failed to create fs request' })
+  }
+
+  res.json({ requestId: data.id })
+})
+
+// GET /mobile/fs/result/:requestId — poll until status = 'ready' | 'error'
+router.get('/fs/result/:requestId', requireMachineAuth, async (req, res) => {
+  const { data: machines } = await db
+    .from('machines')
+    .select('id')
+    .eq('user_id', req.machine.user_id)
+
+  const machineIds = (machines ?? []).map(m => m.id)
+  if (!machineIds.length) return res.status(404).json({ error: 'Request not found' })
+
+  const { data, error } = await db
+    .from('fs_requests')
+    .select('status, result, error')
+    .eq('id', req.params.requestId)
+    .in('machine_id', machineIds)
+    .single()
+
+  if (error || !data) {
+    return res.status(404).json({ error: 'Request not found' })
+  }
+
+  res.json(data)
 })
 
 export default router
