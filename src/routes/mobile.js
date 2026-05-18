@@ -319,23 +319,39 @@ router.get('/command/next', requireMachineAuth, async (req, res) => {
   if (!commands?.length) return res.json(null)
 
   // Claude must have been idle for at least 30s (guards against brief pending_count=0 gaps
-  // between chained tool calls)
+  // between chained tool calls). Also accepts agents with NULL last_activity_at (pre-migration rows).
   const idleThreshold = new Date(Date.now() - 30_000).toISOString()
 
   for (const cmd of commands) {
     let query = db
       .from('agents')
-      .select('id, session_id, cwd')
+      .select('id, session_id, cwd, pending_count, last_activity_at')
       .eq('machine_id', req.machine.id)
       .eq('pending_count', 0)
-      .lt('last_activity_at', idleThreshold)
+      .or(`last_activity_at.lt.${idleThreshold},last_activity_at.is.null`)
 
     if (cmd.session_id) {
       query = query.eq('session_id', cmd.session_id)
     }
 
     const { data: agents } = await query.limit(1)
-    if (!agents?.length) continue
+
+    if (!agents?.length) {
+      // Log why delivery is blocked so the server terminal shows it
+      const { data: blocker } = await db
+        .from('agents')
+        .select('session_id, pending_count, last_activity_at')
+        .eq('machine_id', req.machine.id)
+        .eq('session_id', cmd.session_id ?? '')
+        .maybeSingle()
+
+      if (blocker) {
+        console.log(`[command/next] blocked — session ${cmd.session_id} pending_count=${blocker.pending_count} last_activity=${blocker.last_activity_at}`)
+      } else {
+        console.log(`[command/next] blocked — no agent row found for session ${cmd.session_id ?? '(any)'}`)
+      }
+      continue
+    }
 
     const agent = agents[0]
 
@@ -350,6 +366,7 @@ router.get('/command/next', requireMachineAuth, async (req, res) => {
 
     if (claimErr || !claimed) continue
 
+    console.log(`[command/next] delivering prompt to session ${agent.session_id}`)
     return res.json({
       prompt:     cmd.prompt,
       sessionId:  agent.session_id,
