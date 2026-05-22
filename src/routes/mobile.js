@@ -3,6 +3,8 @@ import { db } from '../supabase.js'
 import { requireMachineAuth } from '../middleware/auth.js'
 import { syncAgentPendingCount, deriveStatus } from '../utils.js'
 
+const ONLINE_THRESHOLD_MS = 90_000
+
 const router = Router()
 
 // GET /mobile/machine — verify credentials (auth middleware already did the DB lookup)
@@ -29,7 +31,7 @@ router.get('/sessions', requireMachineAuth, async (req, res) => {
 
   const { data: agents, error } = await db
     .from('agents')
-    .select('*, machines(id, label, is_online)')
+    .select('*, machines(id, label, is_online, last_seen)')
     .in('machine_id', machineIds)
     .order('last_activity_at', { ascending: false, nullsFirst: false })
 
@@ -38,10 +40,14 @@ router.get('/sessions', requireMachineAuth, async (req, res) => {
     return res.status(500).json({ error: 'Failed to fetch sessions' })
   }
 
+  const now = Date.now()
   const sessions = (agents ?? []).map(agent => ({
     id:               agent.id,
     machine_id:       agent.machine_id,
     machine_label:    agent.machines?.label ?? 'Unknown',
+    machine_is_online: agent.machines?.last_seen
+      ? (now - new Date(agent.machines.last_seen).getTime()) < ONLINE_THRESHOLD_MS
+      : false,
     session_id:       agent.session_id,
     cwd:              agent.cwd,
     status:           deriveStatus(agent.last_activity_at),
@@ -176,8 +182,6 @@ router.post('/decide', requireMachineAuth, async (req, res) => {
 
 // GET /mobile/machines — all machines for this user
 // is_online is derived from last_seen so crashes appear offline automatically
-const ONLINE_THRESHOLD_MS = 90_000
-
 router.get('/machines', requireMachineAuth, async (req, res) => {
   const { data, error } = await db
     .from('machines')
