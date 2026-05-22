@@ -68,15 +68,21 @@ export async function notifyUser(userId, { title, body, requestId }) {
 
   const tokens = rows.map(r => r.token)
 
+  // Data-only message — notifee handles display in all app states.
+  // Sending a notification payload causes Android to auto-display via system
+  // AND fire the background handler, resulting in duplicate or silent notifications.
   const message = {
-    notification: { title, body },
-    data:         { requestId: requestId ?? '' },
+    data: {
+      requestId: requestId ?? '',
+      title:     title ?? '',
+      body:      body  ?? '',
+    },
     android: {
-      priority:     'high',
-      notification: { channelId: 'agent-requests', sound: 'default' },
+      priority: 'high',
     },
     apns: {
-      payload: { aps: { sound: 'default', badge: 1 } },
+      payload: { aps: { contentAvailable: true } },
+      headers: { 'apns-priority': '5' },
     },
     tokens,
   }
