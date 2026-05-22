@@ -128,4 +128,85 @@ router.post('/fs/respond', requireMachineAuth, async (req, res) => {
   res.json({ ok: true })
 })
 
+// ── User-authenticated machine management ─────────────────────────────────────
+
+// GET /machines/mine — list all machines for the signed-in user
+router.get('/mine', requireUserAuth, async (req, res) => {
+  const { data, error } = await db
+    .from('machines')
+    .select('id, label, is_online, last_seen, created_at')
+    .eq('user_id', req.user.id)
+    .order('last_seen', { ascending: false, nullsFirst: false })
+
+  if (error) {
+    console.error('[machines/mine]', error.message)
+    return res.status(500).json({ error: 'Failed to fetch machines' })
+  }
+
+  const now = Date.now()
+  res.json((data ?? []).map(m => ({
+    ...m,
+    is_online: m.last_seen
+      ? (now - new Date(m.last_seen).getTime()) < 90_000
+      : false,
+  })))
+})
+
+// POST /machines/:machineId/reclaim — re-key an existing machine after reinstall
+// Client generates rawKey/apiKeyHash (same pattern as /register) — server only stores the hash
+router.post('/:machineId/reclaim', requireUserAuth, async (req, res) => {
+  const { machineId } = req.params
+  const { apiKeyHash, machineLabel } = req.body
+
+  if (!apiKeyHash) return res.status(400).json({ error: 'apiKeyHash is required' })
+
+  const { data: machine, error: fetchErr } = await db
+    .from('machines')
+    .select('id, user_id')
+    .eq('id', machineId)
+    .single()
+
+  if (fetchErr || !machine) return res.status(404).json({ error: 'Machine not found' })
+  if (machine.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' })
+
+  const update = { api_key_hash: apiKeyHash, is_online: false, last_seen: null }
+  if (machineLabel) update.label = machineLabel
+
+  const { error: updateErr } = await db
+    .from('machines')
+    .update(update)
+    .eq('id', machineId)
+
+  if (updateErr) {
+    console.error('[machines/reclaim]', updateErr.message)
+    return res.status(500).json({ error: 'Reclaim failed' })
+  }
+
+  res.json({ ok: true })
+})
+
+// DELETE /machines/:machineId — remove a ghost machine from the account
+router.delete('/:machineId', requireUserAuth, async (req, res) => {
+  const { data: machine } = await db
+    .from('machines')
+    .select('user_id')
+    .eq('id', req.params.machineId)
+    .single()
+
+  if (!machine || machine.user_id !== req.user.id)
+    return res.status(403).json({ error: 'Forbidden' })
+
+  const { error } = await db
+    .from('machines')
+    .delete()
+    .eq('id', req.params.machineId)
+
+  if (error) {
+    console.error('[machines/delete]', error.message)
+    return res.status(500).json({ error: 'Delete failed — machine may have linked data' })
+  }
+
+  res.json({ ok: true })
+})
+
 export default router
