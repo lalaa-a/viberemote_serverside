@@ -175,6 +175,9 @@ router.post('/decide', requireMachineAuth, async (req, res) => {
 })
 
 // GET /mobile/machines — all machines for this user
+// is_online is derived from last_seen so crashes appear offline automatically
+const ONLINE_THRESHOLD_MS = 90_000
+
 router.get('/machines', requireMachineAuth, async (req, res) => {
   const { data, error } = await db
     .from('machines')
@@ -187,7 +190,15 @@ router.get('/machines', requireMachineAuth, async (req, res) => {
     return res.status(500).json({ error: 'Failed to fetch machines' })
   }
 
-  res.json(data ?? [])
+  const now = Date.now()
+  const machines = (data ?? []).map(m => ({
+    ...m,
+    is_online: m.last_seen
+      ? (now - new Date(m.last_seen).getTime()) < ONLINE_THRESHOLD_MS
+      : false,
+  }))
+
+  res.json(machines)
 })
 
 // POST /mobile/push-token — register or update FCM push token
