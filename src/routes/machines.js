@@ -7,6 +7,7 @@ const router = Router()
 // POST /machines/register
 // Desktop app calls this after user signs in, on first run (no .env yet)
 router.post('/register', requireUserAuth, async (req, res) => {
+  
   const { machineId, machineLabel, apiKeyHash } = req.body
 
   if (!machineId || !machineLabel || !apiKeyHash) {

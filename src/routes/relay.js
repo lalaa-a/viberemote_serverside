@@ -128,6 +128,36 @@ router.post('/decide', requireMachineAuth, async (req, res) => {
   res.json({ ok: true })
 })
 
+// POST /relay/terminal-event
+// Called by postHook.js, notifyHook.js, stopHook.js on the desktop
+router.post('/terminal-event', requireMachineAuth, async (req, res) => {
+  const { session_id, event_type, tool_name, summary, detail, status } = req.body
+
+  if (!session_id || !event_type) {
+    return res.status(400).json({ error: 'session_id and event_type are required' })
+  }
+
+  const { error } = await db
+    .from('terminal_events')
+    .insert({
+      session_id,
+      machine_id: req.machine.id,
+      user_id:    req.machine.user_id,
+      event_type,
+      tool_name:  tool_name ?? null,
+      summary:    summary   ?? null,
+      detail:     detail    ?? null,
+      status:     status    ?? null,
+    })
+
+  if (error) {
+    console.error('[relay/terminal-event]', error.message)
+    return res.status(500).json({ error: error.message })
+  }
+
+  res.json({ ok: true })
+})
+
 // GET /relay/status/:requestId
 // Polling fallback — relay daemon polls this if Realtime is unavailable
 router.get('/status/:requestId', requireMachineAuth, async (req, res) => {

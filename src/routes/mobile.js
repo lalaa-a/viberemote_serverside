@@ -392,6 +392,31 @@ router.get('/command/next', requireMachineAuth, async (req, res) => {
   res.json(null)
 })
 
+// ── Terminal events ───────────────────────────────────────────────────────────
+
+// GET /mobile/terminal?session_id=xxx&limit=60
+router.get('/terminal', requireMachineAuth, async (req, res) => {
+  const { session_id, limit = 60 } = req.query
+
+  let query = db
+    .from('terminal_events')
+    .select('*')
+    .eq('user_id', req.machine.user_id)
+    .order('created_at', { ascending: false })
+    .limit(Math.min(Number(limit), 200))
+
+  if (session_id) query = query.eq('session_id', session_id)
+
+  const { data, error } = await query
+
+  if (error) {
+    console.error('[mobile/terminal]', error.message)
+    return res.status(500).json({ error: 'Failed to fetch terminal events' })
+  }
+
+  res.json({ events: (data ?? []).reverse() })
+})
+
 // ── File browser ──────────────────────────────────────────────────────────────
 
 // POST /mobile/fs/request — ask the desktop to build a file tree
