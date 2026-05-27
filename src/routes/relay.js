@@ -158,25 +158,6 @@ router.post('/terminal-event', requireMachineAuth, async (req, res) => {
   res.json({ ok: true })
 })
 
-// POST /relay/agent-update — called by pty-host.js to mark session as PTY-managed
-router.post('/agent-update', requireMachineAuth, async (req, res) => {
-  const { sessionId, pty_managed } = req.body
-  if (!sessionId) return res.status(400).json({ error: 'sessionId required' })
-
-  const { error } = await db
-    .from('agents')
-    .update({ pty_managed })
-    .eq('session_id', sessionId)
-    .eq('machine_id', req.machine.id)
-
-  if (error) {
-    console.error('[relay/agent-update]', error.message)
-    return res.status(500).json({ error: error.message })
-  }
-
-  res.json({ ok: true })
-})
-
 // GET /relay/status/:requestId
 // Polling fallback — relay daemon polls this if Realtime is unavailable
 router.get('/status/:requestId', requireMachineAuth, async (req, res) => {

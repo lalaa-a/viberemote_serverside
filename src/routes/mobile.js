@@ -377,23 +377,15 @@ router.delete('/prompt/:id', requireMachineAuth, async (req, res) => {
 })
 
 // GET /mobile/command/next — called by heartbeat.js every 10s
-// Also called by pty-host.js with ?session_id=X to claim its own session's commands.
 // Returns the oldest pending command only when the target session is fully idle.
 router.get('/command/next', requireMachineAuth, async (req, res) => {
-  const targetSessionId = req.query.session_id || null
-
-  let commandsQuery = db
+  const { data: commands } = await db
     .from('mobile_commands')
     .select('*')
     .eq('machine_id', req.machine.id)
     .eq('status', 'pending')
     .order('created_at', { ascending: true })
     .limit(10)
-
-  // pty-host calls with ?session_id=X so it only sees its own session's commands
-  if (targetSessionId) commandsQuery = commandsQuery.eq('session_id', targetSessionId)
-
-  const { data: commands } = await commandsQuery
 
   if (!commands?.length) return res.json(null)
 
@@ -408,11 +400,6 @@ router.get('/command/next', requireMachineAuth, async (req, res) => {
       .eq('machine_id', req.machine.id)
       .eq('pending_count', 0)
       .or(`last_activity_at.lt.${idleThreshold},last_activity_at.is.null`)
-
-    if (!targetSessionId) {
-      // Heartbeat call — skip PTY-managed sessions; they poll for their own commands
-      query = query.neq('pty_managed', true)
-    }
 
     if (cmd.session_id) {
       query = query.eq('session_id', cmd.session_id)
