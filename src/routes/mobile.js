@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import jwt from 'jsonwebtoken'
-import { db } from '../supabase.js'
+import { db, authClient } from '../supabase.js'
 import { requireMachineAuth } from '../middleware/auth.js'
 import { syncAgentPendingCount, deriveStatus } from '../utils.js'
 
@@ -30,50 +30,38 @@ router.post('/realtime-token', requireMachineAuth, async (req, res) => {
     return res.json({ token, expiresAt: nowSec + 60 * 60 * 12 })
   }
 
-  // ── Method 2: admin generateLink → exchange for access_token ──────────────
-  // Used when the JWT secret is not accessible (migrated Supabase plans).
-  // Requires the user row to exist in auth.users and have an email.
+  // ── Method 2: admin generateLink + verifyOtp token exchange ──────────────
+  // Used when the JWT secret is not accessible.
+  // admin.generateLink does NOT send an email — it only generates the link.
+  // We immediately exchange the hashed_token for a real session via verifyOtp.
   try {
-    const { data: user } = await db.auth.admin.getUserById(req.machine.user_id)
-    if (!user?.user?.email) {
-      return res.status(500).json({ error: 'Cannot generate Realtime token: user email not found' })
+    const { data: userData, error: userErr } = await db.auth.admin.getUserById(req.machine.user_id)
+    if (userErr || !userData?.user?.email) {
+      console.error('[realtime-token] getUserById failed:', userErr?.message ?? 'no email')
+      return res.status(500).json({ error: 'Realtime token unavailable' })
     }
 
     const { data: linkData, error: linkErr } = await db.auth.admin.generateLink({
       type:  'magiclink',
-      email: user.user.email,
+      email: userData.user.email,
     })
-    if (linkErr) {
-      console.error('[realtime-token] generateLink failed:', linkErr.message)
+    if (linkErr || !linkData?.properties?.hashed_token) {
+      console.error('[realtime-token] generateLink failed:', linkErr?.message)
       return res.status(500).json({ error: 'Realtime token unavailable' })
     }
 
-    // The properties on linkData differ by supabase-js version.
-    // In v2 it's linkData.properties.hashed_token + action_link.
-    // We can extract the access_token from the action_link hash fragment:
-    //   https://<project>.supabase.co/auth/v1/verify?token=<token>&type=magiclink&...
-    //   exchange it via /auth/v1/verify
-    const actionLink  = linkData.properties?.action_link ?? ''
-    const tokenMatch  = actionLink.match(/[?&]token=([^&]+)/)
-    if (!tokenMatch) {
-      return res.status(500).json({ error: 'Realtime token unavailable: could not extract token' })
-    }
-
-    const supabaseUrl  = process.env.SUPABASE_URL
-    const verifyRes    = await fetch(`${supabaseUrl}/auth/v1/verify`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json', apikey: process.env.SUPABASE_ANON_KEY },
-      body:    JSON.stringify({ token: tokenMatch[1], type: 'magiclink' }),
+    // Exchange hashed_token for a real session JWT — this is the documented path
+    const { data: sessionData, error: sessionErr } = await authClient.auth.verifyOtp({
+      token_hash: linkData.properties.hashed_token,
+      type:       'email',
     })
-    const verifyData = await verifyRes.json()
-
-    if (!verifyData.access_token) {
-      console.error('[realtime-token] verify failed:', verifyData)
+    if (sessionErr || !sessionData?.session?.access_token) {
+      console.error('[realtime-token] verifyOtp failed:', sessionErr?.message)
       return res.status(500).json({ error: 'Realtime token unavailable' })
     }
 
-    const nowSec = Math.floor(Date.now() / 1000)
-    return res.json({ token: verifyData.access_token, expiresAt: nowSec + (verifyData.expires_in ?? 3600) })
+    const expiresAt = Math.floor(new Date(sessionData.session.expires_at).getTime() / 1000)
+    return res.json({ token: sessionData.session.access_token, expiresAt })
   } catch (err) {
     console.error('[realtime-token] fallback failed:', err.message)
     return res.status(500).json({ error: 'Realtime token unavailable' })
