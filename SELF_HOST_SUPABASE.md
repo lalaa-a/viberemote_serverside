@@ -28,6 +28,26 @@ You have plenty of headroom. 8 GB is comfortable for this stack.
 
 ---
 
+## ⚠️ Port Plan — Read This First
+
+**Your Node app already owns port 3000** (`insight25.lk` → `127.0.0.1:3000`).
+
+Supabase's Studio dashboard *also* defaults to port 3000, so a naive install would collide with your app. This guide deliberately moves every Supabase host port off 3000. Final allocation on the host:
+
+| Port | Owner | Notes |
+|---|---|---|
+| **3000** | **Your Node app** (PM2) | Untouched — leave it alone |
+| **8000** | Supabase Kong API gateway (HTTP) | All API traffic: REST, Auth, Realtime, Storage |
+| **8443** | Supabase Kong gateway (HTTPS) | Optional; we terminate TLS at nginx instead |
+| **8001** | Supabase Studio dashboard | Remapped from container's internal 3000 → host 8001 |
+| **5432** | Postgres | **Internal Docker network only — never published to host** |
+
+Everything reaches the outside world through **nginx on 443**, which reverse-proxies to Kong (8000) and Studio (8001). Nothing here touches 3000.
+
+> Inside the Docker network, containers still talk to each other on their own internal ports (Studio internally listens on 3000, Realtime on 4000, etc.). That's fine — those are isolated in the Docker bridge network and never bind to the host's 3000.
+
+---
+
 ## Step 1 — Install Docker and Docker Compose
 
 SSH into your VPS and run:
@@ -146,19 +166,20 @@ DASHBOARD_USERNAME=admin
 DASHBOARD_PASSWORD=<pick-a-strong-password>
 
 ############################################
-# Your server's public address
-# Use your VPS IP or domain name
-# NO trailing slash
+# Your server's public address — this is the
+# PUBLIC API subdomain from Step 7 (NOT your
+# Node app's insight25.lk, NOT the dashboard).
+# NO trailing slash.
 ############################################
-SITE_URL=https://your-domain.com
-API_EXTERNAL_URL=https://your-domain.com
+SITE_URL=https://database.insight25.lk
+API_EXTERNAL_URL=https://database.insight25.lk
 
 ############################################
 # SMTP — Supabase needs this to send
 # confirmation/magic-link emails via GoTrue.
 # Use a free Brevo (Sendinblue) or Mailgun account.
 ############################################
-SMTP_ADMIN_EMAIL=noreply@your-domain.com
+SMTP_ADMIN_EMAIL=noreply@insight25.lk
 SMTP_HOST=smtp-relay.brevo.com
 SMTP_PORT=587
 SMTP_USER=<your-smtp-username>
@@ -172,7 +193,18 @@ SMTP_SENDER_NAME=Vibe Remote
 POSTGRES_HOST=db
 POSTGRES_DB=postgres
 POSTGRES_PORT=5432
+
+############################################
+# Port mapping — AVOID 3000 (your Node app)
+# Kong defaults to 8000/8443, which is fine.
+# Studio is remapped to 8001 in Step 5a below.
+############################################
+KONG_HTTP_PORT=8000
+KONG_HTTPS_PORT=8443
+STUDIO_PORT=8001
 ```
+
+> The default `.env.example` already sets `KONG_HTTP_PORT=8000` and `KONG_HTTPS_PORT=8443`, so Kong never clashes with your Node app. `STUDIO_PORT` is not a built-in variable — we wire it up manually in Step 5a so Studio binds to host **8001** instead of **3000**.
 
 > **SMTP is required.** GoTrue (the auth service) will fail to start properly without a valid SMTP config because it needs to send verification emails. Brevo has a free tier of 300 emails/day which is more than enough. Sign up at https://www.brevo.com and use their SMTP credentials.
 
@@ -191,6 +223,24 @@ Open `docker-compose.yml` and comment out (add `#` before the service name line 
 - `vector` — Log collection (feeds analytics)
 
 You **must keep:** `db`, `auth`, `rest`, `realtime`, `meta`, `kong`, `studio`
+
+---
+
+## Step 5a — Remap Studio Off Port 3000 (Required)
+
+By default the `studio` service in `docker-compose.yml` is **not** published to a host port (you'd reach it through Kong). But to give Studio a clean, dedicated URL without it ever touching your Node app's port 3000, we publish it explicitly to host **8001**.
+
+Open `docker-compose.yml`, find the `studio:` service, and add a `ports` mapping so it looks like this:
+
+```yaml
+  studio:
+    container_name: supabase-studio
+    # ... existing image / environment / healthcheck lines stay as they are ...
+    ports:
+      - "127.0.0.1:8001:3000"   # host 8001 → container's internal 3000
+```
+
+> Binding to `127.0.0.1:8001` (not `0.0.0.0:8001`) means Studio is only reachable from the server itself — nginx proxies to it, but it's never exposed to the public internet directly. The container keeps using its internal port 3000; only the **host-side** port changes to 8001, so there's zero conflict with your Node app.
 
 ---
 
@@ -219,13 +269,28 @@ curl http://localhost:8000/rest/v1/  \
   -H "apikey: YOUR_ANON_KEY"
 ```
 
-The Studio dashboard is available at `http://YOUR_SERVER_IP:3000` (or the port mapped in docker-compose.yml for the `studio` service — check with `docker compose ps`).
+The Studio dashboard listens on `http://127.0.0.1:8001` (the host port from Step 5a — **not** 3000, which belongs to your Node app). It's bound to localhost only and **stays private** — see Step 7a for how to view it over an SSH tunnel. Confirm the mapping with `docker compose ps`; you should see `127.0.0.1:8001->3000/tcp` on the studio container.
 
 ---
 
-## Step 7 — Set Up Nginx + SSL
+## Step 7 — Expose the API Publicly (Nginx + SSL on a Subdomain)
 
-You need HTTPS. Your app clients (mobile + desktop) connect to Supabase URLs, and JWT-based auth should never go over plain HTTP.
+**What's public vs. private:**
+
+- **PUBLIC** → the Supabase **API** (Auth / REST / Realtime via the Kong gateway on `8000`). Your mobile + desktop clients connect to this over the internet, so it needs HTTPS.
+- **PRIVATE** → the **Studio dashboard** (host `8001`). You only use it yourself to inspect data, so it is **never** exposed publicly — you'll tunnel to it in Step 7a.
+
+Your Node app already owns `insight25.lk` on 443, so we give Supabase its **own subdomain** — `database.insight25.lk` — as a separate nginx server block. This keeps the two completely independent (separate certs, no path-rewriting, Realtime WebSockets work cleanly).
+
+### 7.0 — Point a DNS record at your server
+
+In your DNS provider, add an **A record**:
+
+```
+database.insight25.lk   →   <YOUR_VPS_PUBLIC_IP>
+```
+
+Wait for it to resolve (`ping database.insight25.lk` should show your VPS IP) before requesting the certificate.
 
 ### Install nginx and Certbot
 
@@ -239,29 +304,29 @@ sudo apt install nginx certbot python3-certbot-nginx -y
 sudo nano /etc/nginx/sites-available/supabase
 ```
 
-Paste this (replace `your-domain.com`):
+Paste this (replace `database.insight25.lk` if you chose a different subdomain). Note this block serves **only the public API** — there is no `/studio/` route here on purpose:
 
 ```nginx
 server {
     listen 80;
-    server_name your-domain.com;
+    server_name database.insight25.lk;
     # Certbot will handle the HTTP→HTTPS redirect after cert issuance
 }
 
 server {
     listen 443 ssl;
-    server_name your-domain.com;
+    server_name database.insight25.lk;
 
     # SSL certs — Certbot fills these in
-    ssl_certificate     /etc/letsencrypt/live/your-domain.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/your-domain.com/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/database.insight25.lk/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/database.insight25.lk/privkey.pem;
     include             /etc/letsencrypt/options-ssl-nginx.conf;
     ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
 
     # Increase body size for file uploads
     client_max_body_size 10m;
 
-    # Supabase API (Kong gateway)
+    # Supabase API (Kong gateway) — Auth, REST, Realtime
     location / {
         proxy_pass         http://127.0.0.1:8000;
         proxy_http_version 1.1;
@@ -272,27 +337,42 @@ server {
         proxy_read_timeout 3600s;   # Keep Realtime WS connections alive
         proxy_send_timeout 3600s;
     }
-
-    # Studio dashboard — restrict to your IP if possible
-    location /studio/ {
-        proxy_pass       http://127.0.0.1:3000/;
-        proxy_set_header Host $host;
-    }
 }
 ```
+
+> This is a brand-new server block on a **different `server_name`** than your Node app. Both can listen on 443 at once — nginx routes by hostname (SNI). Your existing `insight25.lk` config is untouched.
 
 ```bash
 sudo ln -s /etc/nginx/sites-available/supabase /etc/nginx/sites-enabled/
 sudo nginx -t   # check for syntax errors
 
-# Get the SSL certificate
-sudo certbot --nginx -d your-domain.com
+# Get the SSL certificate (only for the Supabase subdomain)
+sudo certbot --nginx -d database.insight25.lk
 
 # Auto-renew is set up by certbot automatically, verify:
 sudo systemctl status certbot.timer
 ```
 
-Now your Supabase is at `https://your-domain.com`.
+Now your **public Supabase API** is at `https://database.insight25.lk` — this is the value your clients use for `SUPABASE_URL`. Auth, REST, and Realtime all live under it:
+
+- Auth:     `https://database.insight25.lk/auth/v1/...`
+- REST:     `https://database.insight25.lk/rest/v1/...`
+- Realtime: `wss://database.insight25.lk/realtime/v1/...`
+
+---
+
+## Step 7a — Access the Studio Dashboard Privately (SSH Tunnel)
+
+Studio is bound to `127.0.0.1:8001` on the server, so it's unreachable from the internet. To view it, forward that port to your own machine over SSH:
+
+```bash
+# Run this on YOUR laptop/desktop (not the server):
+ssh -L 8001:127.0.0.1:8001 user@YOUR_VPS_IP
+```
+
+Leave that SSH session open, then browse to **`http://localhost:8001`** on your machine. You'll be prompted for the `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` you set in Step 4.
+
+> This is the secure way to use the dashboard: no public port, no extra certificate, nothing for an attacker to find. Close the SSH session and the dashboard is gone. If you'd rather have a permanent private URL, the alternative is an nginx block on a second subdomain locked down with `allow <your-ip>; deny all;` + HTTP basic auth — but the tunnel is simpler and safer.
 
 ---
 
@@ -364,7 +444,7 @@ docker exec -i supabase-db-1 psql -U postgres -d postgres < /opt/supabase/auth-u
 
 ### Verify
 
-Open Studio at `https://your-domain.com/studio` and check:
+Open Studio over the SSH tunnel from Step 7a (`http://localhost:8001`) and check:
 - Table Editor — your tables should be there with data
 - Authentication → Users — your users should be listed
 
@@ -381,12 +461,14 @@ SUPABASE_ANON_KEY=eyJ...cloud-anon-key...
 SUPABASE_SERVICE_KEY=eyJ...cloud-service-key...
 SUPABASE_JWT_SECRET=super-secret-cloud-jwt
 
-# After (Self-hosted)
-SUPABASE_URL=https://your-domain.com
+# After (Self-hosted — the public API subdomain from Step 7)
+SUPABASE_URL=https://database.insight25.lk
 SUPABASE_ANON_KEY=<anon key you generated in Step 3c>
 SUPABASE_SERVICE_KEY=<service role key you generated in Step 3c>
 SUPABASE_JWT_SECRET=<jwt secret you generated in Step 3b>
 ```
+
+> `SUPABASE_URL` points at the public **API subdomain**, never at the Studio dashboard. Auth and Realtime resolve under it automatically (`/auth/v1`, `/realtime/v1`).
 
 Restart your Express app:
 
@@ -475,12 +557,15 @@ Do this once a month. Breaking changes are rare but always read the release note
 
 ## Ports Reference
 
-| Service | Internal Port | Exposed Via |
-|---|---|---|
-| Kong API gateway | 8000 | nginx → `https://your-domain.com` |
-| Studio dashboard | 3000 | nginx → `https://your-domain.com/studio` |
-| PostgreSQL | 5432 | NOT exposed externally — internal Docker network only |
-| Realtime | 4000 | Proxied through Kong |
+| Service | Host Port | Bind | Exposed Via |
+|---|---|---|---|
+| **Your Node app** | **3000** | `127.0.0.1` | your existing nginx → `https://insight25.lk` (untouched) |
+| Kong API gateway | 8000 | `127.0.0.1` | nginx → `https://database.insight25.lk` (public API) |
+| Studio dashboard | 8001 | `127.0.0.1` | SSH tunnel only → `http://localhost:8001` (private) |
+| PostgreSQL | 5432 | Docker network | NOT published to host — internal only |
+| Realtime | (internal 4000) | Docker network | Proxied through Kong under `/realtime/v1` |
+
+**Nothing in the Supabase stack binds the host's port 3000** — that stays exclusively your Node app. Kong (8000) and Studio (8001) bind to `127.0.0.1` so they're only reachable through nginx or an SSH tunnel, never directly from the internet.
 
 **Never expose port 5432 to the internet.** Postgres should only be accessible within the Docker network and via `docker exec`.
 
@@ -490,13 +575,16 @@ Do this once a month. Breaking changes are rare but always read the release note
 
 ```bash
 sudo ufw allow ssh
-sudo ufw allow 80/tcp    # HTTP (for Certbot renewals)
-sudo ufw allow 443/tcp   # HTTPS
-sudo ufw allow 3000/tcp  # Your Express API port (if different from 443)
-sudo ufw deny 8000/tcp   # Kong — only nginx should reach this
+sudo ufw allow 80/tcp    # HTTP (Certbot renewals + HTTP→HTTPS redirect)
+sudo ufw allow 443/tcp   # HTTPS — serves BOTH insight25.lk (Node) and database.insight25.lk (API)
+# Port 3000 stays bound to 127.0.0.1 by your Node app — no ufw rule needed; nginx reaches it locally.
+sudo ufw deny 8000/tcp   # Kong — only nginx should reach this (already localhost-bound)
+sudo ufw deny 8001/tcp   # Studio — SSH tunnel only, never public
 sudo ufw deny 5432/tcp   # Postgres — never public
 sudo ufw enable
 ```
+
+> Since both your Node app and Supabase are served by nginx on the single public port 443 (routed by hostname), you don't open any extra public ports. The dashboard is reached purely through SSH, which `ufw allow ssh` already permits.
 
 ---
 
