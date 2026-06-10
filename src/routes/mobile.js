@@ -116,7 +116,9 @@ router.get('/sessions', requireMachineAuth, async (req, res) => {
   res.json(sessions)
 })
 
-// GET /mobile/sessions/:sessionId/requests — pending requests for one session
+// GET /mobile/sessions/:sessionId/requests
+// ?pending=true  → only pending (default for approval screens)
+// ?pending=false → all statuses (for chat feed, default when building history)
 router.get('/sessions/:sessionId/requests', requireMachineAuth, async (req, res) => {
   const { data: machines } = await db
     .from('machines')
@@ -126,13 +128,19 @@ router.get('/sessions/:sessionId/requests', requireMachineAuth, async (req, res)
   const machineIds = (machines ?? []).map(m => m.id)
   if (!machineIds.length) return res.json([])
 
-  const { data, error } = await db
+  let query = db
     .from('pending_requests')
     .select('*, machines(id, label, is_online)')
     .in('machine_id', machineIds)
     .eq('session_id', req.params.sessionId)
-    .eq('status', 'pending')
-    .order('created_at', { ascending: false })
+    .order('created_at', { ascending: true })
+
+  // Only filter to pending when caller explicitly requests it
+  if (req.query.pending === 'true') {
+    query = query.eq('status', 'pending')
+  }
+
+  const { data, error } = await query.limit(100)
 
   if (error) {
     console.error('[mobile/sessions/:sessionId/requests]', error.message)
