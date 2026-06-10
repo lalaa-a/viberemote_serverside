@@ -106,6 +106,7 @@ router.get('/sessions', requireMachineAuth, async (req, res) => {
       : false,
     session_id:       agent.session_id,
     cwd:              agent.cwd,
+    harness:          agent.harness ?? 'claude-code',
     status:           deriveStatus(agent.last_activity_at),
     pending_count:    agent.pending_count ?? 0,
     last_activity_at: agent.last_activity_at,
@@ -437,11 +438,12 @@ router.get('/command/next', requireMachineAuth, async (req, res) => {
 
     if (claimErr || !claimed) continue
 
-    console.log(`[command/next] delivering prompt to session ${agent.session_id}`)
+    console.log(`[command/next] delivering prompt to session ${agent.session_id} harness=${agent.harness ?? 'claude-code'}`)
     return res.json({
       prompt:     cmd.prompt,
       sessionId:  agent.session_id,
       sessionCwd: agent.cwd,
+      harness:    agent.harness ?? 'claude-code',
     })
   }
 

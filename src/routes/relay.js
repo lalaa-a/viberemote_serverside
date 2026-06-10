@@ -9,7 +9,7 @@ const router = Router()
 // POST /relay/agent-ping
 // Called by hook.js on every tool call to upsert the agent row and refresh last_activity_at
 router.post('/agent-ping', requireMachineAuth, async (req, res) => {
-  const { sessionId, cwd } = req.body
+  const { sessionId, cwd, harness } = req.body
 
   if (!sessionId) {
     return res.status(400).json({ error: 'sessionId is required' })
@@ -22,6 +22,7 @@ router.post('/agent-ping', requireMachineAuth, async (req, res) => {
         session_id:       sessionId,
         machine_id:       req.machine.id,
         cwd:              cwd || null,
+        harness:          harness ?? 'claude-code',
         last_activity_at: new Date().toISOString(),
       },
       { onConflict: 'session_id' }
@@ -61,6 +62,7 @@ router.post('/upload', requireMachineAuth, async (req, res) => {
     .from('pending_requests')
     .insert({
       ...payload,
+      harness:    payload.harness ?? 'claude-code',
       agent_id:   agentId,
       machine_id: req.machine.id,
       user_id:    req.machine.user_id,
@@ -144,6 +146,7 @@ router.post('/terminal-event', requireMachineAuth, async (req, res) => {
       machine_id: req.machine.id,
       user_id:    req.machine.user_id,
       event_type,
+      harness:    req.body.harness ?? 'claude-code',
       tool_name:  tool_name ?? null,
       summary:    summary   ?? null,
       detail:     detail    ?? null,
