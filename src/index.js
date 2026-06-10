@@ -1,11 +1,14 @@
 import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { rateLimit } from 'express-rate-limit'
 import machinesRouter from './routes/machines.js'
 import relayRouter from './routes/relay.js'
 import mobileRouter from './routes/mobile.js'
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const app  = express()
 const PORT = process.env.PORT || 3000
 
@@ -32,6 +35,13 @@ const registerLimiter = rateLimit({
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }))
+
+// Landing page GoTrue redirects to after a user clicks the email confirmation link
+// (SITE_URL=https://insight25.lk/confirmed in the Supabase .env points here)
+app.get('/confirmed', (_req, res) => {
+  res.sendFile(path.join(__dirname, '../public/confirmed.html'))
+})
+
 app.use('/machines', machinesRouter)
 app.use('/relay', relayRouter)
 app.use('/mobile', mobileRouter)
