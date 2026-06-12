@@ -107,6 +107,7 @@ router.get('/sessions', requireMachineAuth, async (req, res) => {
     session_id:       agent.session_id,
     cwd:              agent.cwd,
     harness:          agent.harness ?? 'claude-code',
+    cli_alive:        agent.cli_alive !== false,   // default true for older rows
     status:           deriveStatus(agent.last_activity_at),
     pending_count:    agent.pending_count ?? 0,
     last_activity_at: agent.last_activity_at,
@@ -314,13 +315,20 @@ router.post('/prompt', requireMachineAuth, async (req, res) => {
   if (sessionId) {
     const { data: agent } = await db
       .from('agents')
-      .select('machine_id, machines(user_id)')
+      .select('machine_id, cli_alive, machines(user_id)')
       .eq('session_id', sessionId)
       .single()
 
     if (!agent || agent.machines?.user_id !== req.machine.user_id) {
       return res.status(403).json({ error: 'Session not found or access denied' })
     }
+
+    // Refuse to queue a prompt for a session whose CLI has been closed. Resuming
+    // it would spawn a new unattended agent — block it and tell the client.
+    if (agent.cli_alive === false) {
+      return res.status(409).json({ error: 'CLI closed', code: 'cli_closed' })
+    }
+
     targetMachineId = agent.machine_id
   }
 
