@@ -446,12 +446,18 @@ router.get('/command/next', requireMachineAuth, async (req, res) => {
 
     if (claimErr || !claimed) continue
 
-    console.log(`[command/next] delivering prompt to session ${agent.session_id} harness=${agent.harness ?? 'claude-code'}`)
+    // Tell the desktop how stale the session is, so it can decide whether to
+    // inject into the (likely still-open) terminal or resume in a fresh window.
+    const sessionStatus = deriveStatus(agent.last_activity_at)
+
+    console.log(`[command/next] delivering prompt to session ${agent.session_id} harness=${agent.harness ?? 'claude-code'} status=${sessionStatus}`)
     return res.json({
-      prompt:     cmd.prompt,
-      sessionId:  agent.session_id,
-      sessionCwd: agent.cwd,
-      harness:    agent.harness ?? 'claude-code',
+      prompt:      cmd.prompt,
+      sessionId:   agent.session_id,
+      sessionCwd:  agent.cwd,
+      harness:     agent.harness ?? 'claude-code',
+      sessionStatus,
+      lastActivityAt: agent.last_activity_at,
     })
   }
 
