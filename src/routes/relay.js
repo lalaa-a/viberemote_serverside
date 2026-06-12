@@ -24,11 +24,16 @@ router.post('/sessions-alive', requireMachineAuth, async (req, res) => {
       .in('session_id', ids)
   }
 
-  // Mark everything else on this machine as closed
+  // Mark everything else on this machine as closed — EXCEPT sessions that were
+  // active in the last 60s. A pinging session's CLI is provably open, so we never
+  // let a transient gap in the PID-file scan (e.g. a heartbeat network hiccup)
+  // wrongly mark a live session closed and block the user from prompting it.
+  const recentThreshold = new Date(Date.now() - 60_000).toISOString()
   let dead = db.from('agents')
     .update({ cli_alive: false })
     .eq('machine_id', req.machine.id)
     .eq('cli_alive', true)
+    .or(`last_activity_at.lt.${recentThreshold},last_activity_at.is.null`)
   if (ids.length) {
     // PostgREST "not in" list — session IDs are uuids / ses_* (no special chars)
     dead = dead.not('session_id', 'in', `(${ids.join(',')})`)
