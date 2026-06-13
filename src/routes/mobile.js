@@ -106,6 +106,8 @@ router.get('/sessions', requireMachineAuth, async (req, res) => {
       : false,
     session_id:       agent.session_id,
     cwd:              agent.cwd,
+    harness:          agent.harness ?? 'claude-code',
+    cli_alive:        agent.cli_alive !== false,   // default true for older rows
     status:           deriveStatus(agent.last_activity_at),
     pending_count:    agent.pending_count ?? 0,
     last_activity_at: agent.last_activity_at,
@@ -115,7 +117,9 @@ router.get('/sessions', requireMachineAuth, async (req, res) => {
   res.json(sessions)
 })
 
-// GET /mobile/sessions/:sessionId/requests — pending requests for one session
+// GET /mobile/sessions/:sessionId/requests
+// ?pending=true  → only pending (default for approval screens)
+// ?pending=false → all statuses (for chat feed, default when building history)
 router.get('/sessions/:sessionId/requests', requireMachineAuth, async (req, res) => {
   const { data: machines } = await db
     .from('machines')
@@ -125,13 +129,19 @@ router.get('/sessions/:sessionId/requests', requireMachineAuth, async (req, res)
   const machineIds = (machines ?? []).map(m => m.id)
   if (!machineIds.length) return res.json([])
 
-  const { data, error } = await db
+  let query = db
     .from('pending_requests')
     .select('*, machines(id, label, is_online)')
     .in('machine_id', machineIds)
     .eq('session_id', req.params.sessionId)
-    .eq('status', 'pending')
-    .order('created_at', { ascending: false })
+    .order('created_at', { ascending: true })
+
+  // Only filter to pending when caller explicitly requests it
+  if (req.query.pending === 'true') {
+    query = query.eq('status', 'pending')
+  }
+
+  const { data, error } = await query.limit(100)
 
   if (error) {
     console.error('[mobile/sessions/:sessionId/requests]', error.message)
@@ -305,13 +315,20 @@ router.post('/prompt', requireMachineAuth, async (req, res) => {
   if (sessionId) {
     const { data: agent } = await db
       .from('agents')
-      .select('machine_id, machines(user_id)')
+      .select('machine_id, cli_alive, machines(user_id)')
       .eq('session_id', sessionId)
       .single()
 
     if (!agent || agent.machines?.user_id !== req.machine.user_id) {
       return res.status(403).json({ error: 'Session not found or access denied' })
     }
+
+    // Refuse to queue a prompt for a session whose CLI has been closed. Resuming
+    // it would spawn a new unattended agent — block it and tell the client.
+    if (agent.cli_alive === false) {
+      return res.status(409).json({ error: 'CLI closed', code: 'cli_closed' })
+    }
+
     targetMachineId = agent.machine_id
   }
 
@@ -396,7 +413,7 @@ router.get('/command/next', requireMachineAuth, async (req, res) => {
   for (const cmd of commands) {
     let query = db
       .from('agents')
-      .select('id, session_id, cwd, pending_count, last_activity_at')
+      .select('id, session_id, cwd, harness, pending_count, last_activity_at')
       .eq('machine_id', req.machine.id)
       .eq('pending_count', 0)
       .or(`last_activity_at.lt.${idleThreshold},last_activity_at.is.null`)
@@ -437,11 +454,12 @@ router.get('/command/next', requireMachineAuth, async (req, res) => {
 
     if (claimErr || !claimed) continue
 
-    console.log(`[command/next] delivering prompt to session ${agent.session_id}`)
+    console.log(`[command/next] delivering prompt to session ${agent.session_id} harness=${agent.harness ?? 'claude-code'}`)
     return res.json({
       prompt:     cmd.prompt,
       sessionId:  agent.session_id,
       sessionCwd: agent.cwd,
+      harness:    agent.harness ?? 'claude-code',
     })
   }
 
