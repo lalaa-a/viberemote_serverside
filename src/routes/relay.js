@@ -6,10 +6,46 @@ import { notifyUser } from '../notify.js'
 
 const router = Router()
 
+// POST /relay/sessions-alive
+// Called by the heartbeat every ~15s with the session IDs whose harness CLI is
+// still running on this machine. We mark those agents cli_alive=true and every
+// other agent on the machine cli_alive=false (their CLI was closed). Mobile reads
+// cli_alive to block prompting a closed session.
+router.post('/sessions-alive', requireMachineAuth, async (req, res) => {
+  const ids = Array.isArray(req.body.aliveSessionIds)
+    ? req.body.aliveSessionIds.filter(s => typeof s === 'string' && s.length)
+    : []
+
+  // Mark the live ones alive
+  if (ids.length) {
+    await db.from('agents')
+      .update({ cli_alive: true })
+      .eq('machine_id', req.machine.id)
+      .in('session_id', ids)
+  }
+
+  // Mark everything else on this machine as closed
+  let dead = db.from('agents')
+    .update({ cli_alive: false })
+    .eq('machine_id', req.machine.id)
+    .eq('cli_alive', true)
+  if (ids.length) {
+    // PostgREST "not in" list — session IDs are uuids / ses_* (no special chars)
+    dead = dead.not('session_id', 'in', `(${ids.join(',')})`)
+  }
+  const { error } = await dead
+  if (error) {
+    console.error('[relay/sessions-alive]', error.message)
+    return res.status(500).json({ error: error.message })
+  }
+
+  res.json({ ok: true })
+})
+
 // POST /relay/agent-ping
 // Called by hook.js on every tool call to upsert the agent row and refresh last_activity_at
 router.post('/agent-ping', requireMachineAuth, async (req, res) => {
-  const { sessionId, cwd } = req.body
+  const { sessionId, cwd, harness } = req.body
 
   if (!sessionId) {
     return res.status(400).json({ error: 'sessionId is required' })
@@ -22,6 +58,8 @@ router.post('/agent-ping', requireMachineAuth, async (req, res) => {
         session_id:       sessionId,
         machine_id:       req.machine.id,
         cwd:              cwd || null,
+        harness:          harness ?? 'claude-code',
+        cli_alive:        true,   // a session that just acted is definitely open
         last_activity_at: new Date().toISOString(),
       },
       { onConflict: 'session_id' }
@@ -61,6 +99,7 @@ router.post('/upload', requireMachineAuth, async (req, res) => {
     .from('pending_requests')
     .insert({
       ...payload,
+      harness:    payload.harness ?? 'claude-code',
       agent_id:   agentId,
       machine_id: req.machine.id,
       user_id:    req.machine.user_id,
@@ -144,6 +183,7 @@ router.post('/terminal-event', requireMachineAuth, async (req, res) => {
       machine_id: req.machine.id,
       user_id:    req.machine.user_id,
       event_type,
+      harness:    req.body.harness ?? 'claude-code',
       tool_name:  tool_name ?? null,
       summary:    summary   ?? null,
       detail:     detail    ?? null,

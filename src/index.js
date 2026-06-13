@@ -7,6 +7,7 @@ import { rateLimit } from 'express-rate-limit'
 import machinesRouter from './routes/machines.js'
 import relayRouter from './routes/relay.js'
 import mobileRouter from './routes/mobile.js'
+import harnessRouter from './routes/harness.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const app  = express()
@@ -45,6 +46,7 @@ app.get('/confirmed', (_req, res) => {
 app.use('/machines', machinesRouter)
 app.use('/relay', relayRouter)
 app.use('/mobile', mobileRouter)
+app.use('/harness', harnessRouter)
 
 // Apply strict limiter only to the register endpoint
 app.use('/machines/register', registerLimiter)
