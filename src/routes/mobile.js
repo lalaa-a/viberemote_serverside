@@ -129,12 +129,15 @@ router.get('/sessions/:sessionId/requests', requireMachineAuth, async (req, res)
   const machineIds = (machines ?? []).map(m => m.id)
   if (!machineIds.length) return res.json([])
 
+  // Order newest-first + limit so a long session returns the RECENT requests,
+  // not the oldest 100 (the previous ascending+limit silently dropped recent
+  // rows). Reverse before responding so consumers still receive ascending order.
   let query = db
     .from('pending_requests')
     .select('*, machines(id, label, is_online)')
     .in('machine_id', machineIds)
     .eq('session_id', req.params.sessionId)
-    .order('created_at', { ascending: true })
+    .order('created_at', { ascending: false })
 
   // Only filter to pending when caller explicitly requests it
   if (req.query.pending === 'true') {
@@ -148,7 +151,64 @@ router.get('/sessions/:sessionId/requests', requireMachineAuth, async (req, res)
     return res.status(500).json({ error: 'Failed to fetch session requests' })
   }
 
-  res.json(data ?? [])
+  res.json((data ?? []).reverse())
+})
+
+// GET /mobile/sessions/:sessionId/feed?before=<cursor>&limit=40
+//
+// Unified, cursor-paginated chat feed for one session. Merges the three feed
+// sources (terminal_events, pending_requests, mobile_commands) into a single
+// time-ordered, windowed stream so the mobile app can load the most recent page
+// and fetch older pages on scroll (WhatsApp/Telegram style) instead of loading
+// the whole conversation.
+//
+// Backed by the session_feed view + get_session_feed() RPC (migration 006): one
+// ordered DB query with a (created_at, id) tuple cursor — no gaps or duplicates
+// at page boundaries. `before` is an opaque cursor ("<created_at>|<id>") taken
+// from the previous page's nextCursor; omit it for the most-recent page.
+router.get('/sessions/:sessionId/feed', requireMachineAuth, async (req, res) => {
+  const sessionId = req.params.sessionId
+  const userId    = req.machine.user_id
+  const limit     = Math.min(Number(req.query.limit) || 40, 100)
+
+  // Parse the opaque cursor "<created_at>|<id>" (tolerate a bare timestamp).
+  let beforeTs = null
+  let beforeId = null
+  if (req.query.before) {
+    const cur = String(req.query.before)
+    const idx = cur.lastIndexOf('|')
+    if (idx > 0) { beforeTs = cur.slice(0, idx); beforeId = cur.slice(idx + 1) }
+    else         { beforeTs = cur }
+  }
+
+  const { data, error } = await db.rpc('get_session_feed', {
+    p_session_id: sessionId,
+    p_user_id:    userId,
+    p_before_ts:  beforeTs,
+    p_before_id:  beforeId,
+    p_limit:      limit,
+  })
+
+  if (error) {
+    console.error('[mobile/feed]', error.message)
+    return res.status(500).json({ error: 'Failed to fetch feed' })
+  }
+
+  const rowsDesc = data ?? []                 // newest → oldest
+  const hasMore  = rowsDesc.length === limit
+  const oldest   = rowsDesc[rowsDesc.length - 1]
+  const nextCursor = hasMore && oldest ? `${oldest.created_at}|${oldest.id}` : null
+
+  // Reverse to ascending for rendering; map payload → row to keep the client
+  // contract identical to the previous JS-merge implementation.
+  const items = rowsDesc.slice().reverse().map(r => ({
+    source:     r.source,
+    id:         r.id,
+    created_at: r.created_at,
+    row:        r.payload,
+  }))
+
+  res.json({ items, nextCursor, hasMore })
 })
 
 // ── Requests ──────────────────────────────────────────────────────────────────
