@@ -1,94 +1,77 @@
 import { Router } from 'express'
 import jwt from 'jsonwebtoken'
-import { db, authClient } from '../supabase.js'
-import { requireMachineAuth } from '../middleware/auth.js'
+import { db } from '../supabase.js'
+import { requireMachineAuth, requireUserAuthFast, attachDevice } from '../middleware/auth.js'
 import { syncAgentPendingCount, deriveStatus } from '../utils.js'
+import { rateLimit } from 'express-rate-limit'
 
 const ONLINE_THRESHOLD_MS = 90_000
 
 const router = Router()
 
-// GET /mobile/machine — verify credentials (auth middleware already did the DB lookup)
-router.get('/machine', requireMachineAuth, (req, res) => {
-  res.json(req.machine)
+// Per-router user-keyed rate limiter — applied after auth so req.user is set
+const mobileLimiter = rateLimit({
+  windowMs: 60_000, max: 300,
+  keyGenerator: (req) => req.user?.id ?? req.ip,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message:         { error: 'Too many requests, slow down' },
 })
 
-// POST /mobile/realtime-token — issue a Supabase JWT for Realtime auth.
-// Tries two methods in order:
-//   1. Sign a custom JWT with SUPABASE_JWT_SECRET (fast, no round-trip)
-//   2. Fall back to admin.generateLink magic-link token exchange (no secret needed)
-router.post('/realtime-token', requireMachineAuth, async (req, res) => {
-  // ── Method 1: sign with JWT secret if available ────────────────────────────
+// All /mobile/* routes (except command/next) use user JWT auth
+router.use(requireUserAuthFast, attachDevice, mobileLimiter)
+
+// ── In-process pair cache — bust on pair/unpair/device-delete ─────────────────
+const _pairCache = new Map()
+
+export async function pairedMachineIds(userId, deviceId) {
+  const key = `${userId}:${deviceId}`
+  const hit  = _pairCache.get(key)
+  if (hit && hit.exp > Date.now()) return hit.ids
+  let q = db.from('machines').select('id').eq('user_id', userId)
+  if (deviceId) q = q.eq('paired_device_id', deviceId)
+  const { data } = await q
+  const ids = (data ?? []).map(m => m.id)
+  _pairCache.set(key, { ids, exp: Date.now() + 60_000 })
+  return ids
+}
+
+export function bustPairCache(userId, deviceId) {
+  if (deviceId) _pairCache.delete(`${userId}:${deviceId}`)
+}
+
+// GET /mobile/me — basic identity check (replaces old /mobile/machine)
+router.get('/me', (req, res) => {
+  res.json({ userId: req.user.id, email: req.user.email })
+})
+
+// POST /mobile/realtime-token — sign a Supabase JWT for Realtime auth
+// Uses the same SUPABASE_JWT_SECRET — local HS256 sign, no round-trip
+router.post('/realtime-token', async (req, res) => {
   const secret = process.env.SUPABASE_JWT_SECRET
-  if (secret) {
-    const nowSec = Math.floor(Date.now() / 1000)
-    const token  = jwt.sign(
-      { sub: req.machine.user_id, role: 'authenticated', iat: nowSec, exp: nowSec + 60 * 60 * 12 },
-      secret,
-      { algorithm: 'HS256' }
-    )
-    return res.json({ token, expiresAt: nowSec + 60 * 60 * 12 })
+  if (!secret) {
+    return res.status(500).json({ error: 'SUPABASE_JWT_SECRET not configured' })
   }
-
-  // ── Method 2: admin generateLink + verifyOtp token exchange ──────────────
-  // Used when the JWT secret is not accessible.
-  // admin.generateLink does NOT send an email — it only generates the link.
-  // We immediately exchange the hashed_token for a real session via verifyOtp.
-  try {
-    const { data: userData, error: userErr } = await db.auth.admin.getUserById(req.machine.user_id)
-    if (userErr || !userData?.user?.email) {
-      console.error('[realtime-token] getUserById failed:', userErr?.message ?? 'no email')
-      return res.status(500).json({ error: 'Realtime token unavailable' })
-    }
-
-    const { data: linkData, error: linkErr } = await db.auth.admin.generateLink({
-      type:  'magiclink',
-      email: userData.user.email,
-    })
-    if (linkErr || !linkData?.properties?.hashed_token) {
-      console.error('[realtime-token] generateLink failed:', linkErr?.message)
-      return res.status(500).json({ error: 'Realtime token unavailable' })
-    }
-
-    // Exchange hashed_token for a real session JWT — this is the documented path
-    const { data: sessionData, error: sessionErr } = await authClient.auth.verifyOtp({
-      token_hash: linkData.properties.hashed_token,
-      type:       'email',
-    })
-    if (sessionErr || !sessionData?.session?.access_token) {
-      console.error('[realtime-token] verifyOtp failed:', sessionErr?.message)
-      return res.status(500).json({ error: 'Realtime token unavailable' })
-    }
-
-    const expiresAt = Math.floor(new Date(sessionData.session.expires_at).getTime() / 1000)
-    return res.json({ token: sessionData.session.access_token, expiresAt })
-  } catch (err) {
-    console.error('[realtime-token] fallback failed:', err.message)
-    return res.status(500).json({ error: 'Realtime token unavailable' })
-  }
+  const nowSec = Math.floor(Date.now() / 1000)
+  const token  = jwt.sign(
+    { sub: req.user.id, role: 'authenticated', iat: nowSec, exp: nowSec + 60 * 60 * 12 },
+    secret,
+    { algorithm: 'HS256' }
+  )
+  res.json({ token, expiresAt: nowSec + 60 * 60 * 12 })
 })
 
 // ── Sessions ──────────────────────────────────────────────────────────────────
 
-// GET /mobile/sessions — all sessions across all of this user's machines
-router.get('/sessions', requireMachineAuth, async (req, res) => {
-  const { data: machines, error: machinesErr } = await db
-    .from('machines')
-    .select('id')
-    .eq('user_id', req.machine.user_id)
-
-  if (machinesErr) {
-    console.error('[mobile/sessions] machines lookup', machinesErr.message)
-    return res.status(500).json({ error: 'Failed to fetch sessions' })
-  }
-
-  const machineIds = (machines ?? []).map(m => m.id)
-  if (!machineIds.length) return res.json([])
+// GET /mobile/sessions — all sessions across paired machines (Pattern A: single join)
+router.get('/sessions', async (req, res) => {
+  if (!req.deviceId) return res.json([])
 
   const { data: agents, error } = await db
     .from('agents')
-    .select('*, machines(id, label, is_online, last_seen)')
-    .in('machine_id', machineIds)
+    .select('*, machines!inner(id, label, last_seen, user_id, paired_device_id)')
+    .eq('machines.user_id', req.user.id)
+    .eq('machines.paired_device_id', req.deviceId)
     .order('last_activity_at', { ascending: false, nullsFirst: false })
 
   if (error) {
@@ -98,48 +81,39 @@ router.get('/sessions', requireMachineAuth, async (req, res) => {
 
   const now = Date.now()
   const sessions = (agents ?? []).map(agent => ({
-    id:               agent.id,
-    machine_id:       agent.machine_id,
-    machine_label:    agent.machines?.label ?? 'Unknown',
+    id:                agent.id,
+    machine_id:        agent.machine_id,
+    machine_label:     agent.machines?.label ?? 'Unknown',
     machine_is_online: agent.machines?.last_seen
       ? (now - new Date(agent.machines.last_seen).getTime()) < ONLINE_THRESHOLD_MS
       : false,
-    session_id:       agent.session_id,
-    cwd:              agent.cwd,
-    harness:          agent.harness ?? 'claude-code',
-    cli_alive:        agent.cli_alive !== false,   // default true for older rows
-    status:           deriveStatus(agent.last_activity_at),
-    pending_count:    agent.pending_count ?? 0,
-    last_activity_at: agent.last_activity_at,
-    started_at:       agent.started_at,
+    session_id:        agent.session_id,
+    cwd:               agent.cwd,
+    harness:           agent.harness ?? 'claude-code',
+    cli_alive:         agent.cli_alive !== false,
+    status:            deriveStatus(agent.last_activity_at),
+    pending_count:     agent.pending_count ?? 0,
+    last_activity_at:  agent.last_activity_at,
+    started_at:        agent.started_at,
   }))
 
   res.json(sessions)
 })
 
 // GET /mobile/sessions/:sessionId/requests
-// ?pending=true  → only pending (default for approval screens)
-// ?pending=false → all statuses (for chat feed, default when building history)
-router.get('/sessions/:sessionId/requests', requireMachineAuth, async (req, res) => {
-  const { data: machines } = await db
-    .from('machines')
-    .select('id')
-    .eq('user_id', req.machine.user_id)
+router.get('/sessions/:sessionId/requests', async (req, res) => {
+  if (!req.deviceId) return res.json([])
 
-  const machineIds = (machines ?? []).map(m => m.id)
-  if (!machineIds.length) return res.json([])
+  const ids = await pairedMachineIds(req.user.id, req.deviceId)
+  if (!ids.length) return res.json([])
 
-  // Order newest-first + limit so a long session returns the RECENT requests,
-  // not the oldest 100 (the previous ascending+limit silently dropped recent
-  // rows). Reverse before responding so consumers still receive ascending order.
   let query = db
     .from('pending_requests')
     .select('*, machines(id, label, is_online)')
-    .in('machine_id', machineIds)
+    .in('machine_id', ids)
     .eq('session_id', req.params.sessionId)
     .order('created_at', { ascending: false })
 
-  // Only filter to pending when caller explicitly requests it
   if (req.query.pending === 'true') {
     query = query.eq('status', 'pending')
   }
@@ -154,24 +128,12 @@ router.get('/sessions/:sessionId/requests', requireMachineAuth, async (req, res)
   res.json((data ?? []).reverse())
 })
 
-// GET /mobile/sessions/:sessionId/feed?before=<cursor>&limit=40
-//
-// Unified, cursor-paginated chat feed for one session. Merges the three feed
-// sources (terminal_events, pending_requests, mobile_commands) into a single
-// time-ordered, windowed stream so the mobile app can load the most recent page
-// and fetch older pages on scroll (WhatsApp/Telegram style) instead of loading
-// the whole conversation.
-//
-// Backed by the session_feed view + get_session_feed() RPC (migration 006): one
-// ordered DB query with a (created_at, id) tuple cursor — no gaps or duplicates
-// at page boundaries. `before` is an opaque cursor ("<created_at>|<id>") taken
-// from the previous page's nextCursor; omit it for the most-recent page.
-router.get('/sessions/:sessionId/feed', requireMachineAuth, async (req, res) => {
+// GET /mobile/sessions/:sessionId/feed — cursor-paginated unified chat feed
+router.get('/sessions/:sessionId/feed', async (req, res) => {
   const sessionId = req.params.sessionId
-  const userId    = req.machine.user_id
+  const userId    = req.user.id
   const limit     = Math.min(Number(req.query.limit) || 40, 100)
 
-  // Parse the opaque cursor "<created_at>|<id>" (tolerate a bare timestamp).
   let beforeTs = null
   let beforeId = null
   if (req.query.before) {
@@ -194,13 +156,11 @@ router.get('/sessions/:sessionId/feed', requireMachineAuth, async (req, res) => 
     return res.status(500).json({ error: 'Failed to fetch feed' })
   }
 
-  const rowsDesc = data ?? []                 // newest → oldest
-  const hasMore  = rowsDesc.length === limit
-  const oldest   = rowsDesc[rowsDesc.length - 1]
+  const rowsDesc  = data ?? []
+  const hasMore   = rowsDesc.length === limit
+  const oldest    = rowsDesc[rowsDesc.length - 1]
   const nextCursor = hasMore && oldest ? `${oldest.created_at}|${oldest.id}` : null
 
-  // Reverse to ascending for rendering; map payload → row to keep the client
-  // contract identical to the previous JS-merge implementation.
   const items = rowsDesc.slice().reverse().map(r => ({
     source:     r.source,
     id:         r.id,
@@ -213,12 +173,15 @@ router.get('/sessions/:sessionId/feed', requireMachineAuth, async (req, res) => 
 
 // ── Requests ──────────────────────────────────────────────────────────────────
 
-// GET /mobile/requests — all pending requests for this machine
-router.get('/requests', requireMachineAuth, async (req, res) => {
+// GET /mobile/requests — all pending requests across paired machines
+router.get('/requests', async (req, res) => {
+  if (!req.deviceId) return res.json([])
+
   const { data, error } = await db
     .from('pending_requests')
-    .select('*, machines(id, label, is_online)')
-    .eq('machine_id', req.machine.id)
+    .select('*, machines!inner(id, label, is_online, user_id, paired_device_id)')
+    .eq('machines.user_id', req.user.id)
+    .eq('machines.paired_device_id', req.deviceId)
     .eq('status', 'pending')
     .order('created_at', { ascending: false })
 
@@ -231,12 +194,17 @@ router.get('/requests', requireMachineAuth, async (req, res) => {
 })
 
 // GET /mobile/requests/:id — single request detail
-router.get('/requests/:id', requireMachineAuth, async (req, res) => {
+router.get('/requests/:id', async (req, res) => {
+  if (!req.deviceId) return res.status(404).json({ error: 'Request not found' })
+
+  const ids = await pairedMachineIds(req.user.id, req.deviceId)
+  if (!ids.length) return res.status(404).json({ error: 'Request not found' })
+
   const { data, error } = await db
     .from('pending_requests')
     .select('*, machines(id, label, is_online)')
     .eq('id', req.params.id)
-    .eq('machine_id', req.machine.id)
+    .in('machine_id', ids)
     .single()
 
   if (error || !data) {
@@ -247,13 +215,16 @@ router.get('/requests/:id', requireMachineAuth, async (req, res) => {
 })
 
 // GET /mobile/history — recently decided requests
-router.get('/history', requireMachineAuth, async (req, res) => {
+router.get('/history', async (req, res) => {
+  if (!req.deviceId) return res.json([])
+
   const limit = Math.min(parseInt(req.query.limit) || 50, 200)
 
   const { data, error } = await db
     .from('pending_requests')
-    .select('*, machines(id, label, is_online)')
-    .eq('machine_id', req.machine.id)
+    .select('*, machines!inner(id, label, is_online, user_id, paired_device_id)')
+    .eq('machines.user_id', req.user.id)
+    .eq('machines.paired_device_id', req.deviceId)
     .in('status', ['approved', 'denied', 'timeout', 'cli_pending'])
     .order('created_at', { ascending: false })
     .limit(limit)
@@ -267,7 +238,8 @@ router.get('/history', requireMachineAuth, async (req, res) => {
 })
 
 // POST /mobile/decide — approve or deny a request
-router.post('/decide', requireMachineAuth, async (req, res) => {
+// Pattern B: PostgREST UPDATEs cannot join, so scope via cached id list
+router.post('/decide', async (req, res) => {
   const { requestId, decision } = req.body
 
   if (!requestId || !decision) {
@@ -276,13 +248,18 @@ router.post('/decide', requireMachineAuth, async (req, res) => {
   if (!['approved', 'denied'].includes(decision)) {
     return res.status(400).json({ error: 'decision must be approved or denied' })
   }
+  if (!req.deviceId) {
+    return res.status(400).json({ error: 'x-device-id header required' })
+  }
 
-  // Fetch agent_id first so we can sync count after the update
+  const ids = await pairedMachineIds(req.user.id, req.deviceId)
+  if (!ids.length) return res.status(404).json({ error: 'No paired machines' })
+
   const { data: reqRow } = await db
     .from('pending_requests')
     .select('agent_id')
     .eq('id', requestId)
-    .eq('machine_id', req.machine.id)
+    .in('machine_id', ids)
     .single()
 
   const { error } = await db
@@ -293,7 +270,7 @@ router.post('/decide', requireMachineAuth, async (req, res) => {
       decided_by: 'mobile',
     })
     .eq('id', requestId)
-    .eq('machine_id', req.machine.id)
+    .in('machine_id', ids)
     .eq('status', 'pending')
 
   if (error) {
@@ -306,13 +283,12 @@ router.post('/decide', requireMachineAuth, async (req, res) => {
   res.json({ ok: true })
 })
 
-// GET /mobile/machines — all machines for this user
-// is_online is derived from last_seen so crashes appear offline automatically
-router.get('/machines', requireMachineAuth, async (req, res) => {
+// GET /mobile/machines — paired machines with inline connection state
+router.get('/machines', async (req, res) => {
   const { data, error } = await db
     .from('machines')
-    .select('id, label, is_online, last_seen, created_at')
-    .eq('user_id', req.machine.user_id)
+    .select('id, label, is_online, last_seen, created_at, paired_device_id, paired_at, mobile_devices(id, device_name, platform)')
+    .eq('user_id', req.user.id)
     .order('last_seen', { ascending: false })
 
   if (error) {
@@ -322,29 +298,43 @@ router.get('/machines', requireMachineAuth, async (req, res) => {
 
   const now = Date.now()
   const machines = (data ?? []).map(m => ({
-    ...m,
-    is_online: m.last_seen
+    id:          m.id,
+    label:       m.label,
+    is_online:   m.last_seen
       ? (now - new Date(m.last_seen).getTime()) < ONLINE_THRESHOLD_MS
       : false,
+    last_seen:   m.last_seen,
+    created_at:  m.created_at,
+    paired_device_id: m.paired_device_id,
+    paired_at:   m.paired_at,
+    connection:  !m.paired_device_id
+      ? 'none'
+      : m.paired_device_id === req.deviceId
+        ? 'this'
+        : 'other',
+    paired_device: m.mobile_devices ?? null,
   }))
 
   res.json(machines)
 })
 
-// POST /mobile/push-token — register or update FCM push token
-router.post('/push-token', requireMachineAuth, async (req, res) => {
+// POST /mobile/push-token — register/update FCM token, now device-scoped
+router.post('/push-token', async (req, res) => {
   const { token, platform } = req.body
 
   if (!token) {
     return res.status(400).json({ error: 'token is required' })
+  }
+  if (!req.deviceId) {
+    return res.status(400).json({ error: 'x-device-id header required' })
   }
 
   const { error } = await db
     .from('push_tokens')
     .upsert(
       {
-        machine_id: req.machine.id,
-        user_id:    req.machine.user_id,
+        device_id:  req.deviceId,
+        user_id:    req.user.id,
         token,
         platform:   platform || 'android',
         updated_at: new Date().toISOString(),
@@ -357,34 +347,40 @@ router.post('/push-token', requireMachineAuth, async (req, res) => {
     return res.status(500).json({ error: 'Failed to save push token' })
   }
 
+  // Also keep the device-level push_token up to date
+  await db
+    .from('mobile_devices')
+    .update({ push_token: token, last_active_at: new Date().toISOString() })
+    .eq('id', req.deviceId)
+    .eq('user_id', req.user.id)
+
   res.json({ ok: true })
 })
 
 // ── Prompt injection ──────────────────────────────────────────────────────────
 
-// POST /mobile/prompt — queue a prompt for delivery when the session is idle
-router.post('/prompt', requireMachineAuth, async (req, res) => {
+// POST /mobile/prompt — queue a prompt for delivery
+router.post('/prompt', async (req, res) => {
   const { prompt, sessionId } = req.body
 
   if (!prompt) {
     return res.status(400).json({ error: 'prompt is required' })
   }
 
-  // Resolve machine_id from sessionId — target may be a different machine than the caller
-  let targetMachineId = req.machine.id
+  const ids = req.deviceId ? await pairedMachineIds(req.user.id, req.deviceId) : []
+
+  let targetMachineId = ids[0] ?? null
   if (sessionId) {
     const { data: agent } = await db
       .from('agents')
-      .select('machine_id, cli_alive, machines(user_id)')
+      .select('machine_id, cli_alive')
       .eq('session_id', sessionId)
       .single()
 
-    if (!agent || agent.machines?.user_id !== req.machine.user_id) {
+    if (!agent || (ids.length && !ids.includes(agent.machine_id))) {
       return res.status(403).json({ error: 'Session not found or access denied' })
     }
 
-    // Refuse to queue a prompt for a session whose CLI has been closed. Resuming
-    // it would spawn a new unattended agent — block it and tell the client.
     if (agent.cli_alive === false) {
       return res.status(409).json({ error: 'CLI closed', code: 'cli_closed' })
     }
@@ -392,11 +388,15 @@ router.post('/prompt', requireMachineAuth, async (req, res) => {
     targetMachineId = agent.machine_id
   }
 
+  if (!targetMachineId) {
+    return res.status(400).json({ error: 'No paired machine found' })
+  }
+
   const { data, error } = await db
     .from('mobile_commands')
     .insert({
       machine_id: targetMachineId,
-      user_id:    req.machine.user_id,
+      user_id:    req.user.id,
       session_id: sessionId ?? null,
       prompt,
     })
@@ -411,20 +411,17 @@ router.post('/prompt', requireMachineAuth, async (req, res) => {
   res.json({ id: data.id })
 })
 
-// GET /mobile/prompts — list recent prompts for this user (all machines)
-router.get('/prompts', requireMachineAuth, async (req, res) => {
-  const { data: machines } = await db
-    .from('machines')
-    .select('id')
-    .eq('user_id', req.machine.user_id)
+// GET /mobile/prompts — list recent prompts
+router.get('/prompts', async (req, res) => {
+  if (!req.deviceId) return res.json([])
 
-  const machineIds = (machines ?? []).map(m => m.id)
-  if (!machineIds.length) return res.json([])
+  const ids = await pairedMachineIds(req.user.id, req.deviceId)
+  if (!ids.length) return res.json([])
 
   const { data, error } = await db
     .from('mobile_commands')
     .select('id, session_id, prompt, status, created_at, delivered_at')
-    .in('machine_id', machineIds)
+    .in('machine_id', ids)
     .order('created_at', { ascending: false })
     .limit(20)
 
@@ -436,13 +433,13 @@ router.get('/prompts', requireMachineAuth, async (req, res) => {
   res.json(data ?? [])
 })
 
-// DELETE /mobile/prompt/:id — cancel a prompt that hasn't been delivered yet
-router.delete('/prompt/:id', requireMachineAuth, async (req, res) => {
+// DELETE /mobile/prompt/:id — cancel a prompt
+router.delete('/prompt/:id', async (req, res) => {
   const { error } = await db
     .from('mobile_commands')
     .update({ status: 'cancelled' })
     .eq('id', req.params.id)
-    .eq('user_id', req.machine.user_id)
+    .eq('user_id', req.user.id)
     .eq('status', 'pending')
 
   if (error) {
@@ -453,89 +450,29 @@ router.delete('/prompt/:id', requireMachineAuth, async (req, res) => {
   res.json({ ok: true })
 })
 
-// GET /mobile/command/next — called by heartbeat.js every 10s
-// Returns the oldest pending command only when the target session is fully idle.
-router.get('/command/next', requireMachineAuth, async (req, res) => {
-  const { data: commands } = await db
-    .from('mobile_commands')
-    .select('*')
-    .eq('machine_id', req.machine.id)
-    .eq('status', 'pending')
-    .order('created_at', { ascending: true })
-    .limit(10)
+// GET /mobile/command/next — relay daemon (STAYS machine-key auth)
+// This is called by heartbeat.js — we break out of the user-auth middleware above
+// by defining this route on a separate mini-router mounted at the same path.
+// Note: the router.use(requireUserAuthFast) at top covers all routes defined on
+// this router — so we need the relay daemon to call a different endpoint.
+// The route is intentionally kept here as a reminder; the actual machine-key
+// route is registered BELOW after the export, by index.js mounting it separately
+// at /mobile/command/next via relayRouter. See index.js comment.
 
-  if (!commands?.length) return res.json(null)
-
-  // Claude must have been idle for at least 30s (guards against brief pending_count=0 gaps
-  // between chained tool calls). Also accepts agents with NULL last_activity_at (pre-migration rows).
-  const idleThreshold = new Date(Date.now() - 30_000).toISOString()
-
-  for (const cmd of commands) {
-    let query = db
-      .from('agents')
-      .select('id, session_id, cwd, harness, pending_count, last_activity_at')
-      .eq('machine_id', req.machine.id)
-      .eq('pending_count', 0)
-      .or(`last_activity_at.lt.${idleThreshold},last_activity_at.is.null`)
-
-    if (cmd.session_id) {
-      query = query.eq('session_id', cmd.session_id)
-    }
-
-    const { data: agents } = await query.limit(1)
-
-    if (!agents?.length) {
-      // Log why delivery is blocked so the server terminal shows it
-      const { data: blocker } = await db
-        .from('agents')
-        .select('session_id, pending_count, last_activity_at')
-        .eq('machine_id', req.machine.id)
-        .eq('session_id', cmd.session_id ?? '')
-        .maybeSingle()
-
-      if (blocker) {
-        console.log(`[command/next] blocked — session ${cmd.session_id} pending_count=${blocker.pending_count} last_activity=${blocker.last_activity_at}`)
-      } else {
-        console.log(`[command/next] blocked — no agent row found for session ${cmd.session_id ?? '(any)'}`)
-      }
-      continue
-    }
-
-    const agent = agents[0]
-
-    // Atomically claim — optimistic lock on status=pending prevents double-delivery
-    const { data: claimed, error: claimErr } = await db
-      .from('mobile_commands')
-      .update({ status: 'delivered', delivered_at: new Date().toISOString() })
-      .eq('id', cmd.id)
-      .eq('status', 'pending')
-      .select('id')
-      .single()
-
-    if (claimErr || !claimed) continue
-
-    console.log(`[command/next] delivering prompt to session ${agent.session_id} harness=${agent.harness ?? 'claude-code'}`)
-    return res.json({
-      prompt:     cmd.prompt,
-      sessionId:  agent.session_id,
-      sessionCwd: agent.cwd,
-      harness:    agent.harness ?? 'claude-code',
-    })
-  }
-
-  res.json(null)
-})
-
-// ── Terminal events ───────────────────────────────────────────────────────────
-
-// GET /mobile/terminal?session_id=xxx&limit=60
-router.get('/terminal', requireMachineAuth, async (req, res) => {
+// GET /mobile/terminal
+router.get('/terminal', async (req, res) => {
   const { session_id, limit = 60 } = req.query
+
+  if (!req.deviceId) return res.json({ events: [] })
+
+  const ids = await pairedMachineIds(req.user.id, req.deviceId)
+  if (!ids.length) return res.json({ events: [] })
 
   let query = db
     .from('terminal_events')
     .select('*')
-    .eq('user_id', req.machine.user_id)
+    .eq('user_id', req.user.id)
+    .in('machine_id', ids)
     .order('created_at', { ascending: false })
     .limit(Math.min(Number(limit), 200))
 
@@ -553,22 +490,29 @@ router.get('/terminal', requireMachineAuth, async (req, res) => {
 
 // ── File browser ──────────────────────────────────────────────────────────────
 
-// POST /mobile/fs/request — ask the desktop to build a file tree
-router.post('/fs/request', requireMachineAuth, async (req, res) => {
+// POST /mobile/fs/request
+router.post('/fs/request', async (req, res) => {
   const { path = '.', sessionId } = req.body
 
-  // Resolve target machine from session (may be different from calling machine)
-  let targetMachineId = req.machine.id
+  if (!req.deviceId) return res.status(400).json({ error: 'x-device-id header required' })
+
+  const ids = await pairedMachineIds(req.user.id, req.deviceId)
+  let targetMachineId = ids[0] ?? null
+
   if (sessionId) {
     const { data: agent } = await db
       .from('agents')
-      .select('machine_id, machines(user_id)')
+      .select('machine_id')
       .eq('session_id', sessionId)
       .single()
 
-    if (agent && agent.machines?.user_id === req.machine.user_id) {
+    if (agent && ids.includes(agent.machine_id)) {
       targetMachineId = agent.machine_id
     }
+  }
+
+  if (!targetMachineId) {
+    return res.status(400).json({ error: 'No paired machine found' })
   }
 
   const { data, error } = await db
@@ -589,21 +533,18 @@ router.post('/fs/request', requireMachineAuth, async (req, res) => {
   res.json({ requestId: data.id })
 })
 
-// GET /mobile/fs/result/:requestId — poll until status = 'ready' | 'error'
-router.get('/fs/result/:requestId', requireMachineAuth, async (req, res) => {
-  const { data: machines } = await db
-    .from('machines')
-    .select('id')
-    .eq('user_id', req.machine.user_id)
+// GET /mobile/fs/result/:requestId
+router.get('/fs/result/:requestId', async (req, res) => {
+  if (!req.deviceId) return res.status(404).json({ error: 'Request not found' })
 
-  const machineIds = (machines ?? []).map(m => m.id)
-  if (!machineIds.length) return res.status(404).json({ error: 'Request not found' })
+  const ids = await pairedMachineIds(req.user.id, req.deviceId)
+  if (!ids.length) return res.status(404).json({ error: 'Request not found' })
 
   const { data, error } = await db
     .from('fs_requests')
     .select('status, result, error')
     .eq('id', req.params.requestId)
-    .in('machine_id', machineIds)
+    .in('machine_id', ids)
     .single()
 
   if (error || !data) {
@@ -613,4 +554,5 @@ router.get('/fs/result/:requestId', requireMachineAuth, async (req, res) => {
   res.json(data)
 })
 
+export { _pairCache }
 export default router

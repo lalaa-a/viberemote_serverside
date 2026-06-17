@@ -1,13 +1,17 @@
 import { Router } from 'express'
+import { createHash } from 'node:crypto'
 import { db } from '../supabase.js'
-import { requireUserAuth, requireMachineAuth } from '../middleware/auth.js'
+import { requireUserAuth, requireUserAuthFast, requireMachineAuth, attachDevice } from '../middleware/auth.js'
+import { bustPairCache } from './mobile.js'
+
+function sha256(text) {
+  return createHash('sha256').update(text).digest('hex')
+}
 
 const router = Router()
 
 // POST /machines/register
-// Desktop app calls this after user signs in, on first run (no .env yet)
 router.post('/register', requireUserAuth, async (req, res) => {
-  
   const { machineId, machineLabel, apiKeyHash } = req.body
 
   if (!machineId || !machineLabel || !apiKeyHash) {
@@ -42,7 +46,6 @@ router.post('/register', requireUserAuth, async (req, res) => {
 })
 
 // POST /machines/heartbeat
-// Relay daemon calls this every 30s to mark the machine as online
 router.post('/heartbeat', requireMachineAuth, async (req, res) => {
   const { error } = await db
     .from('machines')
@@ -58,7 +61,6 @@ router.post('/heartbeat', requireMachineAuth, async (req, res) => {
 })
 
 // POST /machines/offline
-// Relay daemon calls this on clean shutdown
 router.post('/offline', requireMachineAuth, async (req, res) => {
   await db
     .from('machines')
@@ -70,7 +72,6 @@ router.post('/offline', requireMachineAuth, async (req, res) => {
 
 // ── File tree ─────────────────────────────────────────────────────────────────
 
-// GET /machines/fs/pending — heartbeat polls this every 5s for file tree jobs
 router.get('/fs/pending', requireMachineAuth, async (req, res) => {
   const { data, error } = await db
     .from('fs_requests')
@@ -88,7 +89,6 @@ router.get('/fs/pending', requireMachineAuth, async (req, res) => {
 
   if (!data) return res.json(null)
 
-  // Attach sessionCwd so heartbeat knows which directory to scan
   let sessionCwd = null
   if (data.session_id) {
     const { data: agent } = await db
@@ -102,7 +102,6 @@ router.get('/fs/pending', requireMachineAuth, async (req, res) => {
   res.json({ ...data, sessionCwd })
 })
 
-// POST /machines/fs/respond — heartbeat posts the completed tree (or error)
 router.post('/fs/respond', requireMachineAuth, async (req, res) => {
   const { requestId, tree, error: treeError } = req.body
 
@@ -129,13 +128,177 @@ router.post('/fs/respond', requireMachineAuth, async (req, res) => {
   res.json({ ok: true })
 })
 
+// ── Device management ─────────────────────────────────────────────────────────
+
+// POST /machines/devices — register this phone as a device (get or create)
+router.post('/devices', requireUserAuth, async (req, res) => {
+  const { deviceName = 'Phone', platform = 'android' } = req.body
+
+  const { data, error } = await db
+    .from('mobile_devices')
+    .insert({
+      user_id:     req.user.id,
+      device_name: deviceName,
+      platform,
+    })
+    .select('id')
+    .single()
+
+  if (error) {
+    console.error('[machines/devices POST]', error.message)
+    return res.status(500).json({ error: 'Failed to register device' })
+  }
+
+  res.json({ deviceId: data.id })
+})
+
+// GET /machines/devices — list devices for this user
+router.get('/devices', requireUserAuthFast, async (req, res) => {
+  const { data, error } = await db
+    .from('mobile_devices')
+    .select('id, device_name, platform, last_active_at, created_at')
+    .eq('user_id', req.user.id)
+    .order('last_active_at', { ascending: false })
+
+  if (error) {
+    console.error('[machines/devices GET]', error.message)
+    return res.status(500).json({ error: 'Failed to fetch devices' })
+  }
+
+  res.json(data ?? [])
+})
+
+// DELETE /machines/devices/:deviceId — unregister a device
+router.delete('/devices/:deviceId', requireUserAuth, attachDevice, async (req, res) => {
+  const { deviceId } = req.params
+
+  const { data: device } = await db
+    .from('mobile_devices')
+    .select('user_id')
+    .eq('id', deviceId)
+    .single()
+
+  if (!device || device.user_id !== req.user.id)
+    return res.status(403).json({ error: 'Forbidden' })
+
+  const { error } = await db
+    .from('mobile_devices')
+    .delete()
+    .eq('id', deviceId)
+
+  if (error) {
+    console.error('[machines/devices DELETE]', error.message)
+    return res.status(500).json({ error: 'Delete failed' })
+  }
+
+  bustPairCache(req.user.id, deviceId)
+  res.json({ ok: true })
+})
+
+// ── Pairing ───────────────────────────────────────────────────────────────────
+
+// POST /machines/:machineId/pair — scan QR and pair device to machine
+router.post('/:machineId/pair', requireUserAuth, async (req, res) => {
+  const { machineId } = req.params
+  const { apiKey, deviceId } = req.body
+
+  if (!apiKey || !deviceId) {
+    return res.status(400).json({ error: 'apiKey and deviceId are required' })
+  }
+
+  const { data: m, error: fetchErr } = await db
+    .from('machines')
+    .select('id, user_id, api_key_hash, paired_device_id')
+    .eq('id', machineId)
+    .single()
+
+  if (fetchErr || !m) return res.status(404).json({ error: 'Machine not found' })
+  if (m.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' })
+  if (sha256(apiKey) !== m.api_key_hash) return res.status(403).json({ error: 'QR does not match this machine' })
+
+  if (m.paired_device_id === deviceId) {
+    return res.json({ ok: true, alreadyPaired: true })
+  }
+  if (m.paired_device_id && m.paired_device_id !== deviceId) {
+    return res.status(409).json({ error: 'Machine already paired to another device', code: 'paired_elsewhere' })
+  }
+
+  // Optimistic lock: only claim if still unpaired (prevents TOCTOU race)
+  const { data: claimed } = await db
+    .from('machines')
+    .update({ paired_device_id: deviceId, paired_at: new Date().toISOString() })
+    .eq('id', machineId)
+    .is('paired_device_id', null)
+    .select('id')
+    .maybeSingle()
+
+  if (!claimed) {
+    return res.status(409).json({ error: 'Machine already paired to another device', code: 'paired_elsewhere' })
+  }
+
+  bustPairCache(req.user.id, deviceId)
+  res.json({ ok: true })
+})
+
+// DELETE /machines/:machineId/pair — unpair (mobile or desktop)
+router.delete('/:machineId/pair', requireUserAuth, async (req, res) => {
+  const { machineId } = req.params
+
+  const { data: m } = await db
+    .from('machines')
+    .select('user_id, paired_device_id')
+    .eq('id', machineId)
+    .single()
+
+  if (!m || m.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' })
+
+  const deviceId = m.paired_device_id
+
+  const { error } = await db
+    .from('machines')
+    .update({ paired_device_id: null, paired_at: null })
+    .eq('id', machineId)
+
+  if (error) {
+    console.error('[machines/pair DELETE]', error.message)
+    return res.status(500).json({ error: 'Unpair failed' })
+  }
+
+  if (deviceId) bustPairCache(req.user.id, deviceId)
+  res.json({ ok: true })
+})
+
+// GET /machines/:machineId/pairing — desktop polls this to know QR vs device card
+router.get('/:machineId/pairing', requireUserAuthFast, async (req, res) => {
+  const { machineId } = req.params
+
+  const { data: m, error } = await db
+    .from('machines')
+    .select('user_id, paired_device_id, paired_at, mobile_devices(id, device_name, platform)')
+    .eq('id', machineId)
+    .single()
+
+  if (error || !m) return res.status(404).json({ error: 'Machine not found' })
+  if (m.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' })
+
+  if (!m.paired_device_id) {
+    return res.json({ paired: false })
+  }
+
+  res.json({
+    paired:    true,
+    device:    m.mobile_devices,
+    paired_at: m.paired_at,
+  })
+})
+
 // ── User-authenticated machine management ─────────────────────────────────────
 
-// GET /machines/mine — list all machines for the signed-in user
-router.get('/mine', requireUserAuth, async (req, res) => {
+// GET /machines/mine — list all machines for the signed-in user (with pairing state)
+router.get('/mine', requireUserAuthFast, attachDevice, async (req, res) => {
   const { data, error } = await db
     .from('machines')
-    .select('id, label, is_online, last_seen, created_at')
+    .select('id, label, is_online, last_seen, created_at, paired_device_id, paired_at, mobile_devices(id, device_name, platform)')
     .eq('user_id', req.user.id)
     .order('last_seen', { ascending: false, nullsFirst: false })
 
@@ -150,11 +313,15 @@ router.get('/mine', requireUserAuth, async (req, res) => {
     is_online: m.last_seen
       ? (now - new Date(m.last_seen).getTime()) < 90_000
       : false,
+    connection: !m.paired_device_id
+      ? 'none'
+      : m.paired_device_id === req.deviceId
+        ? 'this'
+        : 'other',
   })))
 })
 
-// POST /machines/:machineId/reclaim — re-key an existing machine after reinstall
-// Client generates rawKey/apiKeyHash (same pattern as /register) — server only stores the hash
+// POST /machines/:machineId/reclaim
 router.post('/:machineId/reclaim', requireUserAuth, async (req, res) => {
   const { machineId } = req.params
   const { apiKeyHash, machineLabel } = req.body
@@ -186,7 +353,7 @@ router.post('/:machineId/reclaim', requireUserAuth, async (req, res) => {
   res.json({ ok: true })
 })
 
-// DELETE /machines/:machineId — remove a ghost machine from the account
+// DELETE /machines/:machineId
 router.delete('/:machineId', requireUserAuth, async (req, res) => {
   const { data: machine } = await db
     .from('machines')

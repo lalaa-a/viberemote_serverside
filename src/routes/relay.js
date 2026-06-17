@@ -2,7 +2,7 @@ import { Router } from 'express'
 import { db } from '../supabase.js'
 import { requireMachineAuth } from '../middleware/auth.js'
 import { syncAgentPendingCount } from '../utils.js'
-import { notifyUser } from '../notify.js'
+import { notifyMachine } from '../notify.js'
 
 const router = Router()
 
@@ -116,8 +116,8 @@ router.post('/upload', requireMachineAuth, async (req, res) => {
 
   await syncAgentPendingCount(agentId)
 
-  // Fire-and-forget push notification — non-blocking, never fails the upload
-  notifyUser(req.machine.user_id, {
+  // Fire-and-forget: notify only the phone paired to this machine
+  notifyMachine(req.machine.id, {
     title:     `${payload.tool_name} needs approval`,
     body:      payload.summary ?? 'A tool-use request is waiting',
     requestId: data.id,

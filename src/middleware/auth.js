@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import jwt from 'jsonwebtoken'
 import { authClient, db } from '../supabase.js'
 
 function sha256(text) {
@@ -20,6 +21,30 @@ export async function requireUserAuth(req, res, next) {
   }
 
   req.user = user
+  next()
+}
+
+// HOT PATH: verify the Supabase access token locally — no network call.
+// Valid for this project because gen-keys.js signs with HS256 + SUPABASE_JWT_SECRET.
+export function requireUserAuthFast(req, res, next) {
+  const header = req.headers.authorization
+  if (!header?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing Authorization header' })
+  }
+  try {
+    const claims = jwt.verify(header.slice(7), process.env.SUPABASE_JWT_SECRET, {
+      algorithms: ['HS256'],
+    })
+    req.user = { id: claims.sub, email: claims.email }
+    return next()
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token' })
+  }
+}
+
+// Resolve the calling device from the x-device-id header set by the phone.
+export function attachDevice(req, _res, next) {
+  req.deviceId = req.headers['x-device-id'] || null
   next()
 }
 

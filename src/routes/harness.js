@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { db } from '../supabase.js'
-import { requireMachineAuth, requireUserAuth } from '../middleware/auth.js'
+import { requireMachineAuth, requireUserAuth, requireUserAuthFast } from '../middleware/auth.js'
 
 const router = Router()
 
@@ -52,9 +52,8 @@ router.get('/desired', requireMachineAuth, async (req, res) => {
   res.json(data ?? [])
 })
 
-// GET /harness/:machineId  (user-authed)
-// Mobile app reads harness state for one of its machines.
-router.get('/:machineId', requireUserAuth, async (req, res) => {
+// GET /harness/:machineId  (fast user-auth — polled every 30s by the Machines tab)
+router.get('/:machineId', requireUserAuthFast, async (req, res) => {
   // Ownership check
   const { data: machine, error: mErr } = await db
     .from('machines')
