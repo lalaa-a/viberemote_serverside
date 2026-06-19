@@ -48,6 +48,19 @@ export function attachDevice(req, _res, next) {
   next()
 }
 
+// Accept EITHER a user JWT (mobile) OR a machine API key (desktop).
+// Used by routes that both sides can call — e.g. unpair, which the phone triggers
+// from the machines tab and the desktop triggers from its paired screen.
+export async function requireUserOrMachine(req, res, next) {
+  if (req.headers.authorization?.startsWith('Bearer ')) {
+    return requireUserAuth(req, res, next)
+  }
+  if (req.headers['x-machine-api-key']) {
+    return requireMachineAuth(req, res, next)
+  }
+  return res.status(401).json({ error: 'Missing authentication' })
+}
+
 // Validates machine API key — used for routes the relay daemon calls
 export async function requireMachineAuth(req, res, next) {
   const apiKey = req.headers['x-machine-api-key']

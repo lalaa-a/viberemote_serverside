@@ -58,8 +58,12 @@ returns table(token text) language sql stable as $$
 $$;
 
 -- 6. Realtime prerequisites for the machines table (desktop pairing poll via Realtime)
--- If you prefer adaptive polling, you can skip these two statements.
-alter publication supabase_realtime add table machines;
+do $$
+begin
+  alter publication supabase_realtime add table machines;
+exception when duplicate_object then
+  null; -- already a member, nothing to do
+end $$;
 alter table machines enable row level security;
 drop policy if exists "owner reads own machines" on machines;
 create policy "owner reads own machines" on machines

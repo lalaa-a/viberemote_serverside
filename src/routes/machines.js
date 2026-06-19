@@ -1,17 +1,23 @@
 import { Router } from 'express'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { db } from '../supabase.js'
-import { requireUserAuth, requireUserAuthFast, requireMachineAuth, attachDevice } from '../middleware/auth.js'
+import { requireUserAuth, requireUserAuthFast, requireMachineAuth, requireUserOrMachine, attachDevice } from '../middleware/auth.js'
 import { bustPairCache } from './mobile.js'
+import { broadcastMachine } from '../realtime.js'
 
 function sha256(text) {
   return createHash('sha256').update(text).digest('hex')
 }
 
+const CHALLENGE_TTL_MS = 5 * 60 * 1000   // QR nonce lifetime
+
 const router = Router()
 
-// POST /machines/register
-router.post('/register', requireUserAuth, async (req, res) => {
+// POST /machines/register — login-free self-registration by the desktop.
+// The machine is created UNOWNED (user_id null); ownership is claimed at pair-time
+// when a logged-in phone scans its QR. No auth header required — possession of a
+// freshly generated machineId + api key is all the desktop has at first run.
+router.post('/register', async (req, res) => {
   const { machineId, machineLabel, apiKeyHash } = req.body
 
   if (!machineId || !machineLabel || !apiKeyHash) {
@@ -24,13 +30,16 @@ router.post('/register', requireUserAuth, async (req, res) => {
     .eq('id', machineId)
     .single()
 
+  // Idempotent: a desktop that still holds this machineId is already registered.
+  // We never overwrite api_key_hash here — that would let anyone holding the id
+  // hijack the key. Re-keying goes through /reclaim (owner-authenticated).
   if (existing) {
-    return res.status(409).json({ error: 'Machine already registered' })
+    return res.json({ ok: true, machineId, alreadyRegistered: true })
   }
 
   const { error } = await db.from('machines').insert({
     id:           machineId,
-    user_id:      req.user.id,
+    user_id:      null,
     label:        machineLabel,
     api_key_hash: apiKeyHash,
     is_online:    true,
@@ -197,13 +206,36 @@ router.delete('/devices/:deviceId', requireUserAuth, attachDevice, async (req, r
 
 // ── Pairing ───────────────────────────────────────────────────────────────────
 
-// POST /machines/:machineId/pair — scan QR and pair device to machine
+// POST /machines/:machineId/challenge — desktop (machine-key) mints a one-time QR
+// nonce just before rendering its QR. The phone echoes it back on /pair.
+router.post('/:machineId/challenge', requireMachineAuth, async (req, res) => {
+  if (req.machine.id !== req.params.machineId) {
+    return res.status(403).json({ error: 'Forbidden' })
+  }
+
+  const challenge  = randomBytes(32).toString('hex')
+  const expiresAt  = new Date(Date.now() + CHALLENGE_TTL_MS).toISOString()
+
+  const { error } = await db
+    .from('machine_challenges')
+    .insert({ machine_id: req.machine.id, challenge, expires_at: expiresAt })
+
+  if (error) {
+    console.error('[machines/challenge]', error.message)
+    return res.status(500).json({ error: 'Failed to create challenge' })
+  }
+
+  res.json({ challenge, expiresAt })
+})
+
+// POST /machines/:machineId/pair — scan QR and pair device to machine.
+// Body: { apiKey, deviceId, challenge }. Claims ownership (user_id) on first pair.
 router.post('/:machineId/pair', requireUserAuth, async (req, res) => {
   const { machineId } = req.params
-  const { apiKey, deviceId } = req.body
+  const { apiKey, deviceId, challenge } = req.body
 
-  if (!apiKey || !deviceId) {
-    return res.status(400).json({ error: 'apiKey and deviceId are required' })
+  if (!apiKey || !deviceId || !challenge) {
+    return res.status(400).json({ error: 'apiKey, deviceId and challenge are required' })
   }
 
   const { data: m, error: fetchErr } = await db
@@ -213,8 +245,27 @@ router.post('/:machineId/pair', requireUserAuth, async (req, res) => {
     .single()
 
   if (fetchErr || !m) return res.status(404).json({ error: 'Machine not found' })
-  if (m.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' })
   if (sha256(apiKey) !== m.api_key_hash) return res.status(403).json({ error: 'QR does not match this machine' })
+  // Owned machines can only be (re)paired by their owner. Unowned (null) → claimable.
+  if (m.user_id && m.user_id !== req.user.id) {
+    return res.status(403).json({ error: 'Machine is owned by another account', code: 'owned_elsewhere' })
+  }
+
+  // Consume the one-time challenge atomically: the UPDATE only matches a row that
+  // is still unused AND unexpired, so a replayed/expired QR claims nothing.
+  const { data: consumed } = await db
+    .from('machine_challenges')
+    .update({ used_at: new Date().toISOString() })
+    .eq('machine_id', machineId)
+    .eq('challenge', challenge)
+    .is('used_at', null)
+    .gt('expires_at', new Date().toISOString())
+    .select('id')
+    .maybeSingle()
+
+  if (!consumed) {
+    return res.status(403).json({ error: 'QR code expired or already used — refresh it on the desktop', code: 'bad_challenge' })
+  }
 
   if (m.paired_device_id === deviceId) {
     return res.json({ ok: true, alreadyPaired: true })
@@ -223,10 +274,18 @@ router.post('/:machineId/pair', requireUserAuth, async (req, res) => {
     return res.status(409).json({ error: 'Machine already paired to another device', code: 'paired_elsewhere' })
   }
 
-  // Optimistic lock: only claim if still unpaired (prevents TOCTOU race)
+  const sessionToken = randomBytes(32).toString('hex')
+
+  // Optimistic lock: only claim if still unpaired (prevents TOCTOU race). Also
+  // stamps ownership (user_id) and the desktop session token in the same write.
   const { data: claimed } = await db
     .from('machines')
-    .update({ paired_device_id: deviceId, paired_at: new Date().toISOString() })
+    .update({
+      user_id:          req.user.id,
+      paired_device_id: deviceId,
+      paired_at:        new Date().toISOString(),
+      session_token:    sessionToken,
+    })
     .eq('id', machineId)
     .is('paired_device_id', null)
     .select('id')
@@ -237,11 +296,14 @@ router.post('/:machineId/pair', requireUserAuth, async (req, res) => {
   }
 
   bustPairCache(req.user.id, deviceId)
+  broadcastMachine(machineId, 'paired')   // nudge the desktop to re-fetch /session
   res.json({ ok: true })
 })
 
-// DELETE /machines/:machineId/pair — unpair (mobile or desktop)
-router.delete('/:machineId/pair', requireUserAuth, async (req, res) => {
+// DELETE /machines/:machineId/pair — unpair. Callable by the owner (user JWT,
+// from the machines tab) OR by the machine itself (api key, from the desktop's
+// paired screen). Clears the device link AND revokes the session token.
+router.delete('/:machineId/pair', requireUserOrMachine, async (req, res) => {
   const { machineId } = req.params
 
   const { data: m } = await db
@@ -250,13 +312,16 @@ router.delete('/:machineId/pair', requireUserAuth, async (req, res) => {
     .eq('id', machineId)
     .single()
 
-  if (!m || m.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' })
+  if (!m) return res.status(404).json({ error: 'Machine not found' })
+  // Authorize: a user may only unpair machines they own; a machine only itself.
+  if (req.user  && m.user_id && m.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' })
+  if (req.machine && req.machine.id !== machineId)         return res.status(403).json({ error: 'Forbidden' })
 
   const deviceId = m.paired_device_id
 
   const { error } = await db
     .from('machines')
-    .update({ paired_device_id: null, paired_at: null })
+    .update({ paired_device_id: null, paired_at: null, session_token: null })
     .eq('id', machineId)
 
   if (error) {
@@ -264,11 +329,41 @@ router.delete('/:machineId/pair', requireUserAuth, async (req, res) => {
     return res.status(500).json({ error: 'Unpair failed' })
   }
 
-  if (deviceId) bustPairCache(req.user.id, deviceId)
+  if (deviceId && m.user_id) bustPairCache(m.user_id, deviceId)
+  broadcastMachine(machineId, 'unpaired')   // nudge the desktop back to the QR
   res.json({ ok: true })
 })
 
-// GET /machines/:machineId/pairing — desktop polls this to know QR vs device card
+// GET /machines/:machineId/session — desktop (machine-key) reads its pairing
+// state on launch and while showing the QR. Returns the session token + the
+// connected device's human-readable name so the desktop can render "Connected to…".
+router.get('/:machineId/session', requireMachineAuth, async (req, res) => {
+  if (req.machine.id !== req.params.machineId) {
+    return res.status(403).json({ error: 'Forbidden' })
+  }
+
+  const { data: m, error } = await db
+    .from('machines')
+    .select('paired_device_id, paired_at, session_token, mobile_devices(id, device_name, platform)')
+    .eq('id', req.machine.id)
+    .single()
+
+  if (error || !m) return res.status(404).json({ error: 'Machine not found' })
+
+  if (!m.paired_device_id) {
+    return res.json({ paired: false })
+  }
+
+  res.json({
+    paired:       true,
+    sessionToken: m.session_token,
+    pairedDevice: m.mobile_devices,
+    pairedAt:     m.paired_at,
+  })
+})
+
+// GET /machines/:machineId/pairing — legacy user-auth pairing poll (kept for
+// backward compatibility; the desktop now uses GET /session with machine-key auth).
 router.get('/:machineId/pairing', requireUserAuthFast, async (req, res) => {
   const { machineId } = req.params
 
