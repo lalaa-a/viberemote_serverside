@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { db } from '../supabase.js'
 import { requireMachineAuth, requireUserAuth, requireUserAuthFast } from '../middleware/auth.js'
+import { broadcastMachine } from '../realtime.js'
 
 const router = Router()
 
@@ -30,6 +31,12 @@ router.post('/report', requireMachineAuth, async (req, res) => {
     console.error('[harness/report]', error.message)
     return res.status(500).json({ error: error.message })
   }
+
+  // Push the change to any listening phone so its Machines tab + chat composer
+  // update instantly instead of waiting up to 30s for the next poll. The desktop
+  // calls /report immediately on every toggle (harness-cli.js), so this fires the
+  // moment a harness is switched on/off. Polling stays as the backstop.
+  broadcastMachine(req.machine.id, 'harness')
 
   res.json({ ok: true })
 })
