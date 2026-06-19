@@ -79,6 +79,20 @@ router.get('/sessions', async (req, res) => {
     return res.status(500).json({ error: 'Failed to fetch sessions' })
   }
 
+  // Which (machine, harness) pairs currently have mobile support toggled on. The
+  // app reads this to disable the composer for a session whose harness isn't
+  // enabled on the desktop (mirrors the authoritative block in POST /prompt).
+  const machineIds = [...new Set((agents ?? []).map(a => a.machine_id))]
+  const enabledSet = new Set()
+  if (machineIds.length) {
+    const { data: hRows } = await db
+      .from('machine_harnesses')
+      .select('machine_id, harness, mobile_enabled')
+      .in('machine_id', machineIds)
+      .eq('mobile_enabled', true)
+    for (const h of hRows ?? []) enabledSet.add(`${h.machine_id}:${h.harness}`)
+  }
+
   const now = Date.now()
   const sessions = (agents ?? []).map(agent => ({
     id:                agent.id,
@@ -91,6 +105,7 @@ router.get('/sessions', async (req, res) => {
     cwd:               agent.cwd,
     harness:           agent.harness ?? 'claude-code',
     cli_alive:         agent.cli_alive !== false,
+    harness_enabled:   enabledSet.has(`${agent.machine_id}:${agent.harness ?? 'claude-code'}`),
     status:            deriveStatus(agent.last_activity_at),
     pending_count:     agent.pending_count ?? 0,
     last_activity_at:  agent.last_activity_at,
@@ -373,7 +388,7 @@ router.post('/prompt', async (req, res) => {
   if (sessionId) {
     const { data: agent } = await db
       .from('agents')
-      .select('machine_id, cli_alive')
+      .select('machine_id, cli_alive, harness')
       .eq('session_id', sessionId)
       .single()
 
@@ -383,6 +398,25 @@ router.post('/prompt', async (req, res) => {
 
     if (agent.cli_alive === false) {
       return res.status(409).json({ error: 'CLI closed', code: 'cli_closed' })
+    }
+
+    // Mobile support for this harness must be toggled ON on the desktop. If the
+    // user never enabled (or has since disabled) mobile mode for this harness, the
+    // desktop hasn't installed the hooks that inject prompts — so a queued prompt
+    // would silently go nowhere. Block here with a clear reason instead.
+    const harness = agent.harness ?? 'claude-code'
+    const { data: hRow } = await db
+      .from('machine_harnesses')
+      .select('mobile_enabled')
+      .eq('machine_id', agent.machine_id)
+      .eq('harness', harness)
+      .maybeSingle()
+
+    if (!hRow?.mobile_enabled) {
+      return res.status(409).json({
+        error: `Mobile support for ${harness} is turned off on the desktop`,
+        code:  'harness_disabled',
+      })
     }
 
     targetMachineId = agent.machine_id
