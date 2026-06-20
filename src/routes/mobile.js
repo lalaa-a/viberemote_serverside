@@ -270,14 +270,11 @@ router.post('/decide', async (req, res) => {
   const ids = await pairedMachineIds(req.user.id, req.deviceId)
   if (!ids.length) return res.status(404).json({ error: 'No paired machines' })
 
-  const { data: reqRow } = await db
-    .from('pending_requests')
-    .select('agent_id')
-    .eq('id', requestId)
-    .in('machine_id', ids)
-    .single()
-
-  const { error } = await db
+  // One round-trip: write + read agent_id back, guarded by status='pending' so a
+  // double-decide (race between phone and PC terminal) can't flip it twice. The
+  // sooner this UPDATE commits, the sooner Supabase Realtime notifies the desktop
+  // hook and other viewers.
+  const { data: updated, error } = await db
     .from('pending_requests')
     .update({
       status:     decision,
@@ -287,15 +284,21 @@ router.post('/decide', async (req, res) => {
     .eq('id', requestId)
     .in('machine_id', ids)
     .eq('status', 'pending')
+    .select('agent_id')
+    .single()
 
-  if (error) {
+  if (error && error.code !== 'PGRST116') {
+    // PGRST116 = no row matched (already decided / not yours) — treat as 409 below.
     console.error('[mobile/decide]', error.message)
     return res.status(500).json({ error: 'Failed to update decision' })
   }
+  if (!updated) {
+    return res.status(409).json({ error: 'Already decided or not found' })
+  }
 
-  await syncAgentPendingCount(reqRow?.agent_id)
-
+  // Respond immediately; keep the pending-count maintenance off the critical path.
   res.json({ ok: true })
+  syncAgentPendingCount(updated.agent_id).catch(() => {})
 })
 
 // GET /mobile/machines — paired machines with inline connection state
