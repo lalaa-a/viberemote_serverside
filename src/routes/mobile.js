@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken'
 import { db } from '../supabase.js'
 import { requireMachineAuth, requireUserAuthFast, attachDevice } from '../middleware/auth.js'
 import { syncAgentPendingCount, deriveStatus } from '../utils.js'
+import { broadcastSession } from '../realtime.js'
 import { rateLimit } from 'express-rate-limit'
 
 const ONLINE_THRESHOLD_MS = 90_000
@@ -284,7 +285,7 @@ router.post('/decide', async (req, res) => {
     .eq('id', requestId)
     .in('machine_id', ids)
     .eq('status', 'pending')
-    .select('agent_id')
+    .select('agent_id, session_id')
     .single()
 
   if (error && error.code !== 'PGRST116') {
@@ -299,6 +300,8 @@ router.post('/decide', async (req, res) => {
   // Respond immediately; keep the pending-count maintenance off the critical path.
   res.json({ ok: true })
   syncAgentPendingCount(updated.agent_id).catch(() => {})
+  // Nudge other viewers of this session so the card flips live for them too.
+  broadcastSession(updated.session_id, 'feed')
 })
 
 // GET /mobile/machines — paired machines with inline connection state
@@ -444,6 +447,9 @@ router.post('/prompt', async (req, res) => {
     console.error('[mobile/prompt]', error.message)
     return res.status(500).json({ error: 'Failed to queue prompt' })
   }
+
+  // Nudge the chat so the sent prompt bubble appears live for any viewer.
+  broadcastSession(sessionId, 'feed')
 
   res.json({ id: data.id })
 })

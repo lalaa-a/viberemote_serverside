@@ -13,9 +13,9 @@
 
 const BROADCAST_URL = `${process.env.SUPABASE_URL}/realtime/v1/api/broadcast`
 
-export function broadcastMachine(machineId, event, payload = {}) {
+function broadcast(topic, event, payload = {}) {
   // Fire-and-forget: a realtime hiccup must never fail or delay the HTTP handler.
-  // The desktop's session poll is the correctness backstop if this never lands.
+  // A poll/refetch is always the correctness backstop if a broadcast never lands.
   fetch(BROADCAST_URL, {
     method:  'POST',
     headers: {
@@ -24,7 +24,26 @@ export function broadcastMachine(machineId, event, payload = {}) {
       Authorization:  `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
     },
     body: JSON.stringify({
-      messages: [{ topic: `machine:${machineId}`, event, payload }],
+      messages: [{ topic, event, payload }],
     }),
   }).catch(() => {})
+}
+
+export function broadcastMachine(machineId, event, payload = {}) {
+  broadcast(`machine:${machineId}`, event, payload)
+}
+
+// Server → mobile push that the open chat listens on. The chat live edge used to
+// rely solely on `postgres_changes`, which the self-hosted Realtime server drops
+// silently when RLS + replica identity aren't aligned (see
+// LIVE_FEED_REALTIME_DIAGNOSIS.md). Broadcast does NOT go through table RLS, so it
+// is the reliable nudge.
+//
+// The payload is intentionally minimal (no row content): the topic `session:<id>`
+// is not RLS-protected, so we never put reasoning/diff text on it. The client
+// re-fetches the user-authed feed endpoint (GET /mobile/sessions/:id/feed) on any
+// nudge — that endpoint is access-controlled, so no data leaks over broadcast.
+export function broadcastSession(sessionId, event = 'feed', payload = {}) {
+  if (!sessionId) return
+  broadcast(`session:${sessionId}`, event, payload)
 }

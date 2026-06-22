@@ -3,6 +3,7 @@ import { db } from '../supabase.js'
 import { requireMachineAuth } from '../middleware/auth.js'
 import { syncAgentPendingCount } from '../utils.js'
 import { notifyMachine } from '../notify.js'
+import { broadcastSession } from '../realtime.js'
 
 const router = Router()
 
@@ -116,6 +117,9 @@ router.post('/upload', requireMachineAuth, async (req, res) => {
 
   await syncAgentPendingCount(agentId)
 
+  // Nudge any open chat so the new request card streams in live (not on the 30s poll)
+  broadcastSession(payload.session_id, 'feed')
+
   // Fire-and-forget: notify only the phone paired to this machine
   notifyMachine(req.machine.id, {
     title:     `${payload.tool_name} needs approval`,
@@ -138,10 +142,10 @@ router.post('/decide', requireMachineAuth, async (req, res) => {
     return res.status(400).json({ error: 'decision must be approved or denied' })
   }
 
-  // Fetch agent_id first so we can sync count after the update
+  // Fetch agent_id + session_id first so we can sync count and nudge the chat
   const { data: reqRow } = await db
     .from('pending_requests')
-    .select('agent_id')
+    .select('agent_id, session_id')
     .eq('id', requestId)
     .eq('machine_id', req.machine.id)
     .single()
@@ -163,6 +167,9 @@ router.post('/decide', requireMachineAuth, async (req, res) => {
   }
 
   await syncAgentPendingCount(reqRow?.agent_id)
+
+  // Nudge any open chat so the card flips to approved/denied live
+  broadcastSession(reqRow?.session_id, 'feed')
 
   res.json({ ok: true })
 })
@@ -194,6 +201,9 @@ router.post('/terminal-event', requireMachineAuth, async (req, res) => {
     console.error('[relay/terminal-event]', error.message)
     return res.status(500).json({ error: error.message })
   }
+
+  // Nudge any open chat so new reasoning/activity streams in live
+  broadcastSession(session_id, 'feed')
 
   res.json({ ok: true })
 })
