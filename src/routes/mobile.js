@@ -241,7 +241,7 @@ router.get('/history', async (req, res) => {
     .select('*, machines!inner(id, label, is_online, user_id, paired_device_id)')
     .eq('machines.user_id', req.user.id)
     .eq('machines.paired_device_id', req.deviceId)
-    .in('status', ['approved', 'denied', 'timeout', 'cli_pending'])
+    .in('status', ['approved', 'denied', 'timeout', 'cli_pending', 'answered'])
     .order('created_at', { ascending: false })
     .limit(limit)
 
@@ -301,6 +301,53 @@ router.post('/decide', async (req, res) => {
   res.json({ ok: true })
   syncAgentPendingCount(updated.agent_id).catch(() => {})
   // Nudge other viewers of this session so the card flips live for them too.
+  broadcastSession(updated.session_id, 'feed')
+})
+
+// POST /mobile/answer — submit the chosen option(s) for a question request
+// Mirrors /mobile/decide, but the "decision" is the picked option(s) instead of
+// approved/denied. The status='pending' + kind='question' guards make a double
+// answer (phone vs PC terminal) a 409 — first write wins.
+router.post('/answer', async (req, res) => {
+  const { requestId, answers } = req.body
+  // answers: [ { question_index, selected:[{index,label}], custom_text? } ]
+
+  if (!requestId || !Array.isArray(answers) || answers.length === 0) {
+    return res.status(400).json({ error: 'requestId and answers are required' })
+  }
+  if (!req.deviceId) {
+    return res.status(400).json({ error: 'x-device-id header required' })
+  }
+
+  const ids = await pairedMachineIds(req.user.id, req.deviceId)
+  if (!ids.length) return res.status(404).json({ error: 'No paired machines' })
+
+  const { data: updated, error } = await db
+    .from('pending_requests')
+    .update({
+      status:           'answered',
+      selected_options: answers,
+      decided_at:       new Date().toISOString(),
+      decided_by:       'mobile',
+    })
+    .eq('id', requestId)
+    .in('machine_id', ids)
+    .eq('kind', 'question')
+    .eq('status', 'pending')
+    .select('agent_id, session_id')
+    .single()
+
+  if (error && error.code !== 'PGRST116') {
+    // PGRST116 = no row matched (already answered / not yours) — treat as 409 below.
+    console.error('[mobile/answer]', error.message)
+    return res.status(500).json({ error: 'Failed to save answer' })
+  }
+  if (!updated) {
+    return res.status(409).json({ error: 'Already answered or not found' })
+  }
+
+  res.json({ ok: true })
+  syncAgentPendingCount(updated.agent_id).catch(() => {})
   broadcastSession(updated.session_id, 'feed')
 })
 

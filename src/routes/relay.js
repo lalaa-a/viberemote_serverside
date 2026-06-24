@@ -122,8 +122,10 @@ router.post('/upload', requireMachineAuth, async (req, res) => {
 
   // Fire-and-forget: notify only the phone paired to this machine
   notifyMachine(req.machine.id, {
-    title:     `${payload.tool_name} needs approval`,
-    body:      payload.summary ?? 'A tool-use request is waiting',
+    title:     payload.kind === 'question'
+      ? 'Claude is asking a question'
+      : `${payload.tool_name} needs approval`,
+    body:      payload.summary ?? 'A request is waiting',
     requestId: data.id,
   })
 
@@ -174,6 +176,46 @@ router.post('/decide', requireMachineAuth, async (req, res) => {
   res.json({ ok: true })
 })
 
+// POST /relay/answer
+// Called by relay.cjs `answer <n>` when the PC terminal answers a question request.
+router.post('/answer', requireMachineAuth, async (req, res) => {
+  const { requestId, answers } = req.body
+
+  if (!requestId || !Array.isArray(answers) || answers.length === 0) {
+    return res.status(400).json({ error: 'requestId and answers are required' })
+  }
+
+  const { data: reqRow } = await db
+    .from('pending_requests')
+    .select('agent_id, session_id')
+    .eq('id', requestId)
+    .eq('machine_id', req.machine.id)
+    .single()
+
+  const { error } = await db
+    .from('pending_requests')
+    .update({
+      status:           'answered',
+      selected_options: answers,
+      decided_at:       new Date().toISOString(),
+      decided_by:       'pc',
+    })
+    .eq('id', requestId)
+    .eq('machine_id', req.machine.id)
+    .eq('kind', 'question')
+    .eq('status', 'pending')
+
+  if (error) {
+    console.error('[relay/answer]', error.message)
+    return res.status(500).json({ error: 'Answer update failed' })
+  }
+
+  await syncAgentPendingCount(reqRow?.agent_id)
+  broadcastSession(reqRow?.session_id, 'feed')
+
+  res.json({ ok: true })
+})
+
 // POST /relay/terminal-event
 // Called by postHook.js, notifyHook.js, stopHook.js on the desktop
 router.post('/terminal-event', requireMachineAuth, async (req, res) => {
@@ -213,7 +255,7 @@ router.post('/terminal-event', requireMachineAuth, async (req, res) => {
 router.get('/status/:requestId', requireMachineAuth, async (req, res) => {
   const { data, error } = await db
     .from('pending_requests')
-    .select('status, decided_by, decided_at')
+    .select('status, decided_by, decided_at, selected_options')
     .eq('id', req.params.requestId)
     .eq('machine_id', req.machine.id)
     .single()

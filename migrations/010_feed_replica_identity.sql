@@ -25,3 +25,4 @@
 alter table public.terminal_events  replica identity full;
 alter table public.pending_requests replica identity full;
 alter table public.mobile_commands  replica identity full;
+
