@@ -3,7 +3,7 @@ import jwt from 'jsonwebtoken'
 import { db } from '../supabase.js'
 import { requireMachineAuth, requireUserAuthFast, attachDevice } from '../middleware/auth.js'
 import { syncAgentPendingCount, deriveStatus } from '../utils.js'
-import { broadcastSession } from '../realtime.js'
+import { broadcastSession, broadcastMachine } from '../realtime.js'
 import { rateLimit } from 'express-rate-limit'
 
 const ONLINE_THRESHOLD_MS = 90_000
@@ -497,6 +497,12 @@ router.post('/prompt', async (req, res) => {
 
   // Nudge the chat so the sent prompt bubble appears live for any viewer.
   broadcastSession(sessionId, 'feed')
+
+  // Wake the desktop relay instantly. Broadcast is reliable where postgres_changes is
+  // silently dropped on this self-hosted Supabase, so the daemon claims + injects in
+  // ~1s instead of waiting for its backstop poll. Payload carries only the sessionId
+  // (never prompt text) on the un-RLS'd topic. See FAST_PROMPT_DELIVERY_DESIGN.md.
+  broadcastMachine(targetMachineId, 'command_available', { sessionId: sessionId ?? null })
 
   res.json({ id: data.id })
 })

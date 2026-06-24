@@ -42,11 +42,20 @@ const registerLimiter = rateLimit({
 // Mounted BEFORE /mobile so this path is handled by machine auth, not user auth.
 const commandRouter = Router()
 commandRouter.get('/next', requireMachineAuth, async (req, res) => {
-  const { data: commands } = await db
+  // The desktop may scope the claim to one session (?session=<id>) when it KNOWS that
+  // CLI is idle (its local busy-flag is clear). Scoped claims skip the coarse 30s
+  // last_activity gate — that gate is what made delivery slow. The unscoped backstop
+  // path keeps the legacy time gate as a safety net. See FAST_PROMPT_DELIVERY_DESIGN.md.
+  const scopedSession = req.query.session || null
+
+  let pendingQ = db
     .from('mobile_commands')
     .select('*')
     .eq('machine_id', req.machine.id)
     .eq('status', 'pending')
+  if (scopedSession) pendingQ = pendingQ.eq('session_id', scopedSession)
+
+  const { data: commands } = await pendingQ
     .order('created_at', { ascending: true })
     .limit(10)
 
@@ -60,7 +69,12 @@ commandRouter.get('/next', requireMachineAuth, async (req, res) => {
       .select('id, session_id, cwd, harness, pending_count, last_activity_at')
       .eq('machine_id', req.machine.id)
       .eq('pending_count', 0)
-      .or(`last_activity_at.lt.${idleThreshold},last_activity_at.is.null`)
+
+    // Only the unscoped backstop applies the 30s idle timer; a scoped call trusts the
+    // desktop's busy-flag gating, so it delivers the instant the turn ends.
+    if (!scopedSession) {
+      query = query.or(`last_activity_at.lt.${idleThreshold},last_activity_at.is.null`)
+    }
 
     if (cmd.session_id) {
       query = query.eq('session_id', cmd.session_id)
