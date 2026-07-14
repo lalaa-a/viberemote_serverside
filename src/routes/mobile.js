@@ -425,6 +425,52 @@ router.post('/push-token', async (req, res) => {
   res.json({ ok: true })
 })
 
+// ── Stop (interrupt an in-flight turn) ──────────────────────────────────────────
+// This does NOT kill the harness CLI process — it only interrupts the current
+// turn (ESC for Claude Code, session.abort() for OpenCode, ESC into the PTY for
+// Gemini CLI), same as pressing Esc yourself. See STOP_AGENT_DESIGN.md.
+
+// POST /mobile/sessions/:sessionId/stop — interrupt an active turn
+router.post('/sessions/:sessionId/stop', async (req, res) => {
+  const { sessionId } = req.params
+
+  const ids = req.deviceId ? await pairedMachineIds(req.user.id, req.deviceId) : []
+  const { data: agent } = await db
+    .from('agents')
+    .select('machine_id, cli_alive, harness')
+    .eq('session_id', sessionId)
+    .single()
+
+  if (!agent || (ids.length && !ids.includes(agent.machine_id))) {
+    return res.status(403).json({ error: 'Session not found or access denied' })
+  }
+  if (agent.cli_alive === false) {
+    return res.status(409).json({ error: 'CLI closed', code: 'cli_closed' })
+  }
+
+  const { data, error } = await db
+    .from('stop_requests')
+    .insert({
+      session_id: sessionId,
+      machine_id: agent.machine_id,
+      user_id:    req.user.id,
+      harness:    agent.harness ?? 'claude-code',
+    })
+    .select('id')
+    .single()
+
+  if (error) {
+    console.error('[mobile/stop]', error.message)
+    return res.status(500).json({ error: 'Failed to queue stop request' })
+  }
+
+  // Same fast-path used for prompt delivery — wakes heartbeat.js in ~1s.
+  // Payload carries harness so heartbeat can dispatch without an extra round trip.
+  broadcastMachine(agent.machine_id, 'stop_requested', { sessionId, harness: agent.harness })
+
+  res.json({ id: data.id })
+})
+
 // ── Prompt injection ──────────────────────────────────────────────────────────
 
 // POST /mobile/prompt — queue a prompt for delivery
@@ -441,7 +487,7 @@ router.post('/prompt', async (req, res) => {
   if (sessionId) {
     const { data: agent } = await db
       .from('agents')
-      .select('machine_id, cli_alive, harness')
+      .select('machine_id, cli_alive, harness, last_activity_at')
       .eq('session_id', sessionId)
       .single()
 
@@ -469,6 +515,16 @@ router.post('/prompt', async (req, res) => {
       return res.status(409).json({
         error: `Mobile support for ${harness} is turned off on the desktop`,
         code:  'harness_disabled',
+      })
+    }
+
+    // Block sending into a session that's mid-turn — the only mobile action while
+    // busy is Stop (POST /mobile/sessions/:id/stop), not queuing a follow-up prompt.
+    // Reuses the same recency heuristic already exposed to mobile as agents.status.
+    if (deriveStatus(agent.last_activity_at) === 'active') {
+      return res.status(409).json({
+        error: 'Agent is currently working — stop it or wait before sending a new prompt',
+        code:  'session_busy',
       })
     }
 

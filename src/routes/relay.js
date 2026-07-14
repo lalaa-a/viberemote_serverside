@@ -250,6 +250,46 @@ router.post('/terminal-event', requireMachineAuth, async (req, res) => {
   res.json({ ok: true })
 })
 
+// GET /relay/stop-requests — poll backstop for the stop_requested broadcast.
+// Called by heartbeat.js (claude-code/opencode) and by the gemini-cli PTY wrapper
+// process (vibe run gemini-cli), which can't receive heartbeat's in-process
+// broadcast handler since it's a separate OS process. harness is captured on the
+// row at insert time (POST /mobile/sessions/:id/stop), so no join is needed here.
+router.get('/stop-requests', requireMachineAuth, async (req, res) => {
+  const { session } = req.query
+  let q = db.from('stop_requests')
+    .select('id, session_id, harness')
+    .eq('machine_id', req.machine.id)
+    .eq('status', 'pending')
+  if (session) q = q.eq('session_id', session)
+
+  const { data, error } = await q
+  if (error) {
+    console.error('[relay/stop-requests]', error.message)
+    return res.status(500).json({ error: error.message })
+  }
+
+  res.json({ requests: data ?? [] })
+})
+
+// POST /relay/stop-ack — mark stop request(s) delivered so they stop showing in polls.
+router.post('/stop-ack', requireMachineAuth, async (req, res) => {
+  const ids = Array.isArray(req.body.ids) ? req.body.ids : []
+  if (!ids.length) return res.json({ ok: true })
+
+  const { error } = await db.from('stop_requests')
+    .update({ status: 'delivered', delivered_at: new Date().toISOString() })
+    .in('id', ids)
+    .eq('machine_id', req.machine.id)
+
+  if (error) {
+    console.error('[relay/stop-ack]', error.message)
+    return res.status(500).json({ error: error.message })
+  }
+
+  res.json({ ok: true })
+})
+
 // GET /relay/status/:requestId
 // Polling fallback — relay daemon polls this if Realtime is unavailable
 router.get('/status/:requestId', requireMachineAuth, async (req, res) => {
