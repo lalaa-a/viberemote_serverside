@@ -76,6 +76,35 @@ router.post('/agent-ping', requireMachineAuth, async (req, res) => {
   res.json({ agentId: data.id })
 })
 
+// POST /relay/agent-touch
+// Lightweight keepalive: refresh ONLY last_activity_at for a session whose turn is in
+// flight. Unlike /agent-ping (an upsert that would clobber cwd/harness with nulls and
+// could create phantom rows), this is a plain UPDATE scoped to an existing agent row.
+// The heartbeat calls this while a session is busy (busy flag present, or fresh reasoning
+// streaming) so deriveStatus stays 'active' through long reasoning phases and long single
+// tool runs — closing the window where mobile briefly saw 'idle' mid-turn and unlocked
+// the composer, letting a prompt slip in while the agent was still working.
+router.post('/agent-touch', requireMachineAuth, async (req, res) => {
+  const { sessionId } = req.body
+
+  if (!sessionId) {
+    return res.status(400).json({ error: 'sessionId is required' })
+  }
+
+  const { error } = await db
+    .from('agents')
+    .update({ last_activity_at: new Date().toISOString() })
+    .eq('machine_id', req.machine.id)
+    .eq('session_id', sessionId)
+
+  if (error) {
+    console.error('[relay/agent-touch]', error.message)
+    return res.status(500).json({ error: 'Agent touch failed' })
+  }
+
+  res.json({ ok: true })
+})
+
 // POST /relay/upload
 // Called by hook.js when Claude Code fires a tool-use event
 router.post('/upload', requireMachineAuth, async (req, res) => {
@@ -242,6 +271,19 @@ router.post('/terminal-event', requireMachineAuth, async (req, res) => {
   if (error) {
     console.error('[relay/terminal-event]', error.message)
     return res.status(500).json({ error: error.message })
+  }
+
+  // A 'stop' event means the turn ended. The agent-touch keepalive holds a busy session
+  // 'active'; without an explicit turn-end signal it would linger 'active' for the full
+  // 30s window before decaying. Backdate last_activity_at just past that window so
+  // deriveStatus flips to 'idle' immediately and mobile unlocks the composer the moment
+  // "Task complete" shows. Keep this threshold in sync with deriveStatus() in utils.js.
+  if (event_type === 'stop') {
+    await db
+      .from('agents')
+      .update({ last_activity_at: new Date(Date.now() - 31_000).toISOString() })
+      .eq('machine_id', req.machine.id)
+      .eq('session_id', session_id)
   }
 
   // Nudge any open chat so new reasoning/activity streams in live
