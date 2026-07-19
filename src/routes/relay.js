@@ -105,6 +105,50 @@ router.post('/agent-touch', requireMachineAuth, async (req, res) => {
   res.json({ ok: true })
 })
 
+// POST /relay/usage
+// Live token usage for a session's CURRENT turn (see TOKEN_USAGE_STREAMING_DESIGN.md).
+// The desktop harnesses send ABSOLUTE running totals (never deltas), so a dropped update
+// self-heals on the next one. We (1) persist the totals on the agent row — durable across a
+// mobile remount — and (2) broadcast a lightweight 'usage' event on the session topic for
+// the live compose-bar counter. Token counts are non-sensitive integers, so unlike the feed
+// nudge they ride the broadcast payload directly (no refetch round-trip).
+router.post('/usage', requireMachineAuth, async (req, res) => {
+  const { sessionId, turnInput = 0, turnOutput = 0, sessionInput, sessionOutput, cost } = req.body
+
+  if (!sessionId) {
+    return res.status(400).json({ error: 'sessionId is required' })
+  }
+
+  const patch = {
+    turn_tokens_input:  Math.max(0, Math.round(turnInput)),
+    turn_tokens_output: Math.max(0, Math.round(turnOutput)),
+    tokens_updated_at:  new Date().toISOString(),
+  }
+  if (sessionInput  != null) patch.session_tokens_input  = Math.max(0, Math.round(sessionInput))
+  if (sessionOutput != null) patch.session_tokens_output = Math.max(0, Math.round(sessionOutput))
+
+  const { error } = await db
+    .from('agents')
+    .update(patch)
+    .eq('machine_id', req.machine.id)
+    .eq('session_id', sessionId)
+
+  if (error) {
+    console.error('[relay/usage]', error.message)
+    return res.status(500).json({ error: 'Usage update failed' })
+  }
+
+  broadcastSession(sessionId, 'usage', {
+    turnInput:     patch.turn_tokens_input,
+    turnOutput:    patch.turn_tokens_output,
+    sessionInput:  patch.session_tokens_input,
+    sessionOutput: patch.session_tokens_output,
+    cost:          cost ?? null,
+  })
+
+  res.json({ ok: true })
+})
+
 // POST /relay/upload
 // Called by hook.js when Claude Code fires a tool-use event
 router.post('/upload', requireMachineAuth, async (req, res) => {

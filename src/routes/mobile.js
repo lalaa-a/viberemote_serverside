@@ -111,6 +111,12 @@ router.get('/sessions', async (req, res) => {
     pending_count:     agent.pending_count ?? 0,
     last_activity_at:  agent.last_activity_at,
     started_at:        agent.started_at,
+    // Live token usage — durable seed for the mobile compose-bar counter on remount; the
+    // live path is the 'usage' broadcast. See TOKEN_USAGE_STREAMING_DESIGN.md.
+    turn_tokens_input:    agent.turn_tokens_input    ?? 0,
+    turn_tokens_output:   agent.turn_tokens_output   ?? 0,
+    session_tokens_input: agent.session_tokens_input ?? 0,
+    session_tokens_output:agent.session_tokens_output?? 0,
   }))
 
   res.json(sessions)
