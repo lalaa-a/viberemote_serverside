@@ -12,6 +12,7 @@ import relayRouter from './routes/relay.js'
 import mobileRouter from './routes/mobile.js'
 import harnessRouter from './routes/harness.js'
 import profileRouter from './routes/profile.js'
+import { startStaleSweeper } from './sweeper.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const app  = express()
@@ -151,4 +152,6 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`Vibe Remote API listening on port ${PORT}`)
   console.log(`Supabase project: ${process.env.SUPABASE_URL}`)
+  // Close out turns abandoned by a disconnected desktop (STALE_WORKING_ON_DISCONNECT_DESIGN.md §3-B).
+  startStaleSweeper()
 })
