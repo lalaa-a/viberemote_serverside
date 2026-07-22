@@ -76,6 +76,10 @@ router.post('/offline', requireMachineAuth, async (req, res) => {
     .update({ is_online: false })
     .eq('id', req.machine.id)
 
+  // Push it — the mobile flips this machine offline instantly instead of waiting for last_seen
+  // to go stale. See INSTANT_OFFLINE_AND_HARNESS_UPDATES.md §4.
+  broadcastMachine(req.machine.id, 'offline')
+
   res.json({ ok: true })
 })
 

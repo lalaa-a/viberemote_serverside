@@ -6,7 +6,10 @@ import { syncAgentPendingCount, deriveStatus } from '../utils.js'
 import { broadcastSession, broadcastMachine } from '../realtime.js'
 import { rateLimit } from 'express-rate-limit'
 
-const ONLINE_THRESHOLD_MS = 90_000
+// Backstop for the derived online state (presence is the instant path — see
+// INSTANT_OFFLINE_AND_HARNESS_UPDATES.md). Kept at ~3× the 15s machine heartbeat so a single
+// missed heartbeat doesn't flip a live machine offline.
+const ONLINE_THRESHOLD_MS = 45_000
 
 const router = Router()
 

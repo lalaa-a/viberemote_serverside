@@ -14,15 +14,40 @@
 // machine running a long single tool can have stale `last_activity_at` too, and we must NOT
 // falsely end that. Machine-offline is the unambiguous "desktop is gone" signal.
 import { db } from './supabase.js'
-import { broadcastSession } from './realtime.js'
+import { broadcastSession, broadcastMachine } from './realtime.js'
 
 const TICK_MS          = 45_000
 const ACTIVE_WINDOW_MS = 30_000        // matches deriveStatus: < 30s = 'active'
 const IDLE_FLOOR_MS    = 10 * 60_000   // matches deriveStatus: > 10min = 'finished' (too old to bother)
-const OFFLINE_MS       = 90_000        // matches ONLINE_THRESHOLD_MS in routes/mobile.js
+const OFFLINE_MS       = 45_000        // matches ONLINE_THRESHOLD_MS in routes/mobile.js
+
+// Flip the stored `is_online` column false (and push it) for machines whose heartbeat has
+// lapsed — the durability backstop behind Realtime presence for sudden death (no clean
+// /machines/offline). See INSTANT_OFFLINE_AND_HARNESS_UPDATES.md §4.
+async function sweepOfflineMachines(now) {
+  const { data: machines, error } = await db
+    .from('machines')
+    .select('id')
+    .eq('is_online', true)
+    .lt('last_seen', new Date(now - OFFLINE_MS).toISOString())
+
+  if (error) { console.error('[sweeper] machines', error.message); return }
+  if (!machines?.length) return
+
+  const ids = machines.map(m => m.id)
+  await db.from('machines').update({ is_online: false }).in('id', ids)
+  for (const id of ids) {
+    broadcastMachine(id, 'offline')
+    console.log(`[sweeper] marked machine ${id} offline (heartbeat lapsed)`)
+  }
+}
 
 async function sweepOnce() {
   const now = Date.now()
+
+  // First flip any lapsed machines offline (and push it), so the turn sweep below sees the
+  // up-to-date machine state.
+  await sweepOfflineMachines(now)
 
   // Candidates: recently went stale (activity 30s–10min ago) AND the machine is now offline.
   const { data: agents, error } = await db
