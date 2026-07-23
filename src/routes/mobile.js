@@ -733,7 +733,6 @@ router.delete('/sessions/:sessionId', async (req, res) => {
 
     // Authoritative: remove the agent/session row (this is what the sessions list is built from).
     const { error } = await db.from('agents').delete()
-      .eq('user_id', userId)
       .eq('session_id', sessionId)
     if (error) throw error
 
