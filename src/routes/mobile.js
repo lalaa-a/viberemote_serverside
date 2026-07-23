@@ -715,24 +715,34 @@ router.get('/fs/result/:requestId', async (req, res) => {
   res.json(data)
 })
 
-router.delete('/mobile/sessions/:sessionId', async (req, res) => {
-  const { sessionId } = req.params;
-  const userId = req.user.id; 
+// DELETE /mobile/sessions/:sessionId — the router is mounted at /mobile, so the path here is
+// RELATIVE (`/sessions/...`), matching the sibling routes above (e.g. /sessions/:sessionId/stop).
+// Removes the session row plus its related feed / requests / queued prompts, all user-scoped.
+router.delete('/sessions/:sessionId', async (req, res) => {
+  const { sessionId } = req.params
+  const userId = req.user.id
 
   try {
-    const { error } = await supabase
-      .from('agents')
-      .delete()
+    // Best-effort cleanup of the session's related rows so nothing lingers after deletion.
+    for (const table of ['terminal_events', 'pending_requests', 'mobile_commands']) {
+      const { error } = await db.from(table).delete()
+        .eq('user_id', userId)
+        .eq('session_id', sessionId)
+      if (error) console.error(`[mobile/delete-session] ${table}:`, error.message)
+    }
+
+    // Authoritative: remove the agent/session row (this is what the sessions list is built from).
+    const { error } = await db.from('agents').delete()
+      .eq('user_id', userId)
       .eq('session_id', sessionId)
-      .eq('user_id', userId);
+    if (error) throw error
 
-    if (error) throw error;
-
-    return res.json({ ok: true });
+    return res.json({ ok: true })
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    console.error('[mobile/delete-session]', err.message)
+    return res.status(500).json({ error: err.message })
   }
-});
+})
 
 export { _pairCache }
 export default router
