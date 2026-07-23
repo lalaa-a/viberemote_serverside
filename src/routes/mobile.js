@@ -715,5 +715,24 @@ router.get('/fs/result/:requestId', async (req, res) => {
   res.json(data)
 })
 
+router.delete('/mobile/sessions/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+  const userId = req.user.id; 
+
+  try {
+    const { error } = await supabase
+      .from('agents')
+      .delete()
+      .eq('session_id', sessionId)
+      .eq('user_id', userId);
+
+    if (error) throw error;
+
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 export { _pairCache }
 export default router
