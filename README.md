@@ -636,5 +636,3 @@ Session status (active/idle/finished) is **never stored** — derived at query t
 Broadcasts send only nudge events (e.g., `{ event: "feed" }`). Clients re-fetch full data via authed REST endpoints. This keeps broadcast payloads tiny and avoids stale data.
 
 ---
-
-*Generated: 2026-08-20*
