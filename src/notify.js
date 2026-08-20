@@ -52,8 +52,67 @@ function getApp() {
   return app;
 }
 
-// Send a push notification to every FCM token registered for the user.
-// Called from /relay/upload — fire-and-forget, never blocks the response.
+async function sendToTokens(tokens, { title, body, requestId }) {
+  const message = {
+    data: {
+      requestId: requestId ?? "",
+      title:     title    ?? "",
+      body:      body     ?? "",
+    },
+    android: { priority: "high" },
+    apns: {
+      payload: { aps: { contentAvailable: true } },
+      headers: { "apns-priority": "5" },
+    },
+    tokens,
+  };
+
+  try {
+    const response = await admin.messaging().sendEachForMulticast(message);
+    const succeeded = response.responses.filter((r) => r.success).length;
+    console.log(`[notify] Sent ${succeeded}/${tokens.length} notifications for request ${requestId}`);
+
+    const stale = response.responses
+      .map((r, i) =>
+        !r.success &&
+        r.error?.code === "messaging/registration-token-not-registered"
+          ? tokens[i]
+          : null,
+      )
+      .filter(Boolean);
+
+    if (stale.length) {
+      console.log("[notify] Removing", stale.length, "stale token(s)");
+      await db.from("push_tokens").delete().in("token", stale);
+    }
+  } catch (err) {
+    console.error("[notify] FCM sendEachForMulticast failed:", err.message);
+  }
+}
+
+// Send push to the phone paired with a specific machine (device-scoped).
+// Uses machine_push_tokens RPC — one indexed round-trip, no seq scan.
+export async function notifyMachine(machineId, { title, body, requestId }) {
+  if (!getApp()) return;
+
+  const { data: rows, error } = await db.rpc("machine_push_tokens", {
+    p_machine_id: machineId,
+  });
+
+  if (error) {
+    console.error("[notify] machine_push_tokens RPC failed:", error.message);
+    return;
+  }
+
+  if (!rows?.length) {
+    console.log("[notify] No paired phone / push token for machine", machineId);
+    return;
+  }
+
+  await sendToTokens(rows.map((r) => r.token), { title, body, requestId });
+}
+
+// Send a push to every token for a user (kept for broadcast use-cases).
 export async function notifyUser(userId, { title, body, requestId }) {
   if (!getApp()) return;
 
@@ -72,49 +131,5 @@ export async function notifyUser(userId, { title, body, requestId }) {
     return;
   }
 
-  const tokens = rows.map((r) => r.token);
-
-  // Data-only message — notifee handles display in all app states.
-  // Sending a notification payload causes Android to auto-display via system
-  // AND fire the background handler, resulting in duplicate or silent notifications.
-  const message = {
-    data: {
-      requestId: requestId ?? "",
-      title: title ?? "",
-      body: body ?? "",
-    },
-    android: {
-      priority: "high",
-    },
-    apns: {
-      payload: { aps: { contentAvailable: true } },
-      headers: { "apns-priority": "5" },
-    },
-    tokens,
-  };
-
-  try {
-    const response = await admin.messaging().sendEachForMulticast(message);
-    const succeeded = response.responses.filter((r) => r.success).length;
-    console.log(
-      `[notify] Sent ${succeeded}/${tokens.length} notifications for request ${requestId}`,
-    );
-
-    // Remove tokens that are no longer valid
-    const stale = response.responses
-      .map((r, i) =>
-        !r.success &&
-        r.error?.code === "messaging/registration-token-not-registered"
-          ? tokens[i]
-          : null,
-      )
-      .filter(Boolean);
-
-    if (stale.length) {
-      console.log("[notify] Removing", stale.length, "stale token(s)");
-      await db.from("push_tokens").delete().in("token", stale);
-    }
-  } catch (err) {
-    console.error("[notify] FCM sendEachForMulticast failed:", err.message);
-  }
+  await sendToTokens(rows.map((r) => r.token), { title, body, requestId });
 }

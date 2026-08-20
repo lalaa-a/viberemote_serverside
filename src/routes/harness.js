@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { db } from '../supabase.js'
-import { requireMachineAuth, requireUserAuth } from '../middleware/auth.js'
+import { requireMachineAuth, requireUserAuth, requireUserAuthFast } from '../middleware/auth.js'
+import { broadcastMachine } from '../realtime.js'
 
 const router = Router()
 
@@ -31,6 +32,35 @@ router.post('/report', requireMachineAuth, async (req, res) => {
     return res.status(500).json({ error: error.message })
   }
 
+  // Reconcile remote-control desires: a report reflects the desktop's ACTUAL state.
+  // Any pending desired_enabled that now matches reality has been fulfilled, so we
+  // clear it. Without this it lingers forever and the 15s apply-desired loop keeps
+  // re-applying it — which silently undoes a later manual desktop toggle (toggle
+  // off → bounces back on). We only clear when desired == actual, so a desire that
+  // hasn't been applied yet (actual still differs) survives until it takes effect.
+  const enabled  = rows.filter(r => r.mobile_enabled).map(r => r.harness)
+  const disabled = rows.filter(r => !r.mobile_enabled).map(r => r.harness)
+  if (enabled.length) {
+    await db.from('machine_harnesses')
+      .update({ desired_enabled: null })
+      .eq('machine_id', req.machine.id)
+      .in('harness', enabled)
+      .eq('desired_enabled', true)
+  }
+  if (disabled.length) {
+    await db.from('machine_harnesses')
+      .update({ desired_enabled: null })
+      .eq('machine_id', req.machine.id)
+      .in('harness', disabled)
+      .eq('desired_enabled', false)
+  }
+
+  // Push the change to any listening phone so its Machines tab + chat composer
+  // update instantly instead of waiting up to 30s for the next poll. The desktop
+  // calls /report immediately on every toggle (harness-cli.js), so this fires the
+  // moment a harness is switched on/off. Polling stays as the backstop.
+  broadcastMachine(req.machine.id, 'harness')
+
   res.json({ ok: true })
 })
 
@@ -52,9 +82,8 @@ router.get('/desired', requireMachineAuth, async (req, res) => {
   res.json(data ?? [])
 })
 
-// GET /harness/:machineId  (user-authed)
-// Mobile app reads harness state for one of its machines.
-router.get('/:machineId', requireUserAuth, async (req, res) => {
+// GET /harness/:machineId  (fast user-auth — polled every 30s by the Machines tab)
+router.get('/:machineId', requireUserAuthFast, async (req, res) => {
   // Ownership check
   const { data: machine, error: mErr } = await db
     .from('machines')
