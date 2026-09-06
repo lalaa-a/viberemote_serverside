@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken'
 // gen-keys.js — run with: node gen-keys.js
 //const jwt = require('jsonwebtoken')
 
+
 const JWT_SECRET = '__add__your__token'
 
 const anonKey = jwt.sign(
